@@ -1,9 +1,11 @@
 use std::fs;
-use std::path::Path;
-use std::process::Command;
 
 use skill_manager::{DiscoverError, DiscoverRequest, discover};
 use tempfile::TempDir;
+
+mod common;
+
+use common::TestRepository;
 
 #[test]
 fn library_discovers_a_root_skill_at_head() {
@@ -183,71 +185,54 @@ fn library_reports_missing_revisions_and_repositories_without_skills() {
     assert!(matches!(no_skills, DiscoverError::NoSkills(_)));
 }
 
-struct TestRepository {
-    _directory: TempDir,
-    path: std::path::PathBuf,
-}
+#[test]
+fn library_preserves_trailing_whitespace_in_the_repository_path() {
+    let repository = TestRepository::new("source-repository ");
+    repository.write("SKILL.md", "# Root\n");
+    repository.commit("add root skill");
 
-impl TestRepository {
-    fn new(name: &str) -> Self {
-        let parent = TempDir::new().unwrap();
-        let path = parent.path().join(name);
-        fs::create_dir(&path).unwrap();
-        git(&path, ["init", "--quiet"]);
-        git(&path, ["config", "user.email", "test@example.com"]);
-        git(&path, ["config", "user.name", "Test User"]);
+    let discovery = discover(DiscoverRequest::new(repository.path())).unwrap();
 
-        Self {
-            _directory: parent,
-            path,
-        }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn write(&self, path: &str, contents: &str) {
-        let path = self.path().join(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, contents).unwrap();
-    }
-
-    fn commit(&self, message: &str) -> String {
-        git(self.path(), ["add", "."]);
-        git(self.path(), ["commit", "--quiet", "-m", message]);
-        git(self.path(), ["rev-parse", "HEAD"])
-    }
-
-    fn git(&self, arguments: &[&str]) -> String {
-        let output = Command::new("git")
-            .args(arguments)
-            .current_dir(self.path())
-            .output()
-            .unwrap();
-
-        assert!(
-            output.status.success(),
-            "git failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    }
-}
-
-fn git<const N: usize>(directory: &Path, arguments: [&str; N]) -> String {
-    let output = Command::new("git")
-        .args(arguments)
-        .current_dir(directory)
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "git failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+    assert_eq!(
+        discovery.source.path,
+        fs::canonicalize(repository.path())
+            .unwrap()
+            .to_str()
+            .unwrap()
     );
+    assert_eq!(discovery.skills[0].name, "source-repository ");
+}
 
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+#[test]
+fn library_resolves_a_tag_whose_name_begins_with_a_hyphen() {
+    let repository = TestRepository::new("source-repository");
+    repository.write("SKILL.md", "# Root\n");
+    let commit = repository.commit("add root skill");
+    repository.git(&["update-ref", "refs/tags/--foo", "HEAD"]);
+
+    let discovery =
+        discover(DiscoverRequest::new(repository.path()).with_revision("--foo")).unwrap();
+
+    assert_eq!(discovery.requested_revision, "--foo");
+    assert_eq!(discovery.resolved_commit, commit);
+}
+
+#[test]
+fn library_ignores_uncommitted_changes_to_tracked_skill_files() {
+    let repository = TestRepository::new("source-repository");
+    repository.write("stable/SKILL.md", "# Stable\n");
+    repository.commit("add stable skill");
+    fs::remove_file(repository.path().join("stable/SKILL.md")).unwrap();
+    repository.write("working-tree/SKILL.md", "# Untracked\n");
+
+    let discovery = discover(DiscoverRequest::new(repository.path())).unwrap();
+
+    assert_eq!(
+        discovery
+            .skills
+            .iter()
+            .map(|skill| skill.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["stable"]
+    );
 }

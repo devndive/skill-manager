@@ -97,7 +97,12 @@ pub fn discover(request: DiscoverRequest) -> Result<Discovery, DiscoverError> {
     let revision_expression = format!("{requested_revision}^{{commit}}");
     let resolved_commit = git_text(
         &repository_root,
-        ["rev-parse", "--verify", revision_expression.as_str()],
+        [
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            revision_expression.as_str(),
+        ],
     )
     .map_err(|error| match error {
         GitFailure::Unavailable(error) => DiscoverError::GitUnavailable(error),
@@ -238,7 +243,7 @@ enum GitFailure {
 
 fn git_text<const N: usize>(repository: &Path, arguments: [&str; N]) -> Result<String, GitFailure> {
     String::from_utf8(git_bytes(repository, arguments)?)
-        .map(|output| output.trim().to_owned())
+        .map(strip_line_ending)
         .map_err(|_| GitFailure::InvalidUtf8)
 }
 
@@ -273,4 +278,55 @@ fn contains_path(parent: &str, child: &str) -> bool {
         || child
             .strip_prefix(parent)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn strip_line_ending(mut output: String) -> String {
+    if output.ends_with('\n') {
+        output.pop();
+        if output.ends_with('\r') {
+            output.pop();
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::process::Command;
+
+    use tempfile::TempDir;
+
+    use super::{DiscoverRequest, discover};
+
+    #[test]
+    fn public_api_discovers_the_committed_tree() {
+        let directory = TempDir::new().unwrap();
+        let repository = directory.path().join("source-repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--quiet"]);
+        git(&repository, &["config", "user.email", "test@example.com"]);
+        git(&repository, &["config", "user.name", "Test User"]);
+        fs::write(repository.join("SKILL.md"), "# Root\n").unwrap();
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "--quiet", "-m", "add root skill"]);
+        fs::remove_file(repository.join("SKILL.md")).unwrap();
+
+        let discovery = discover(DiscoverRequest::new(&repository)).unwrap();
+
+        assert_eq!(discovery.skills[0].path, ".");
+    }
+
+    fn git(repository: &std::path::Path, arguments: &[&str]) {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(repository)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

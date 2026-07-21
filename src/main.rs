@@ -18,7 +18,7 @@ enum Commands {
         /// Path to the local Source Repository.
         local_source: PathBuf,
         /// Branch, tag, or commit to inspect instead of HEAD.
-        #[arg(long = "ref", value_name = "REVISION")]
+        #[arg(long = "ref", value_name = "REVISION", allow_hyphen_values = true)]
         reference: Option<String>,
         /// Emit the versioned JSON schema.
         #[arg(long)]
