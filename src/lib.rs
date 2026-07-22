@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -215,6 +215,80 @@ pub struct SkillSelection {
     pub skills: Vec<Skill>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkillSelectionList {
+    pub schema_version: u32,
+    pub manifest_path: String,
+    pub sources: Vec<ListedSourceRepository>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListedSourceRepository {
+    pub source: SourceRepository,
+    pub requested_revision: String,
+    pub resolved_commit: String,
+    pub skills: Vec<ListedSkill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListedSkill {
+    pub identity: SkillIdentity,
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedSourceRepository {
+    pub manifest_path: String,
+    pub source: SourceRepository,
+}
+
+#[derive(Debug)]
+pub struct PreparedSourceRemoval {
+    manifest_path: PathBuf,
+    source: SourceRepository,
+    document: DocumentMut,
+}
+
+impl PreparedSourceRemoval {
+    pub fn source(&self) -> &SourceRepository {
+        &self.source
+    }
+
+    pub fn confirm(mut self) -> Result<RemovedSourceRepository, SelectError> {
+        let manifest_parent = self
+            .manifest_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let canonical_parent =
+            fs::canonicalize(manifest_parent).map_err(|source| SelectError::ManifestDirectory {
+                path: display_path(manifest_parent),
+                source,
+            })?;
+        let sources = self.document["sources"]
+            .as_array_of_tables_mut()
+            .expect("manifest sources were validated as an array of tables");
+        for index in (0..sources.len()).rev() {
+            if stored_source_matches(
+                sources.get(index).expect("source index is in bounds"),
+                &self.source,
+                &canonical_parent,
+            ) {
+                sources.remove(index);
+            }
+        }
+
+        ensure_selection_not_cancelled()?;
+        write_manifest_atomic(&self.manifest_path, self.document.to_string().as_bytes())?;
+
+        Ok(RemovedSourceRepository {
+            manifest_path: display_path(&self.manifest_path),
+            source: self.source,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractiveSkillOption {
     pub name: String,
@@ -336,6 +410,10 @@ pub enum SelectError {
         #[source]
         source: io::Error,
     },
+    #[error("invalid Source Repository '{input}': {details}")]
+    InvalidRemovalSource { input: String, details: String },
+    #[error("Source Repository '{input}' is not selected in manifest '{path}'")]
+    SourceNotSelected { input: String, path: String },
 }
 
 #[derive(Debug, Error)]
@@ -388,6 +466,156 @@ pub fn select(request: SelectRequest) -> Result<SkillSelection, SelectError> {
     persist_selection(discovery, request.manifest_path, skills)
 }
 
+pub fn list_selections(
+    manifest_path: impl Into<PathBuf>,
+) -> Result<SkillSelectionList, SelectError> {
+    let manifest_path = manifest_path.into();
+    let (canonical_parent, document) = load_manifest(&manifest_path, false)?;
+    let sources = document["sources"]
+        .as_array_of_tables()
+        .expect("manifest sources were validated as an array of tables");
+    let mut listed_sources = sources
+        .iter()
+        .map(|source| listed_source(source, &canonical_parent))
+        .collect::<Vec<_>>();
+    listed_sources.sort_by(|left, right| {
+        left.source.path.cmp(&right.source.path).then_with(|| {
+            left.source
+                .repository_type
+                .cmp(right.source.repository_type)
+        })
+    });
+
+    Ok(SkillSelectionList {
+        schema_version: 1,
+        manifest_path: display_path(&manifest_path),
+        sources: listed_sources,
+    })
+}
+
+pub fn prepare_source_removal(
+    source: impl Into<String>,
+    manifest_path: impl Into<PathBuf>,
+) -> Result<PreparedSourceRemoval, SelectError> {
+    let source = source.into();
+    let manifest_path = manifest_path.into();
+    let (canonical_parent, document) = load_manifest(&manifest_path, false)?;
+    let requested_source = removal_source_identity(&source)?;
+    let sources = document["sources"]
+        .as_array_of_tables()
+        .expect("manifest sources were validated as an array of tables");
+    if !sources
+        .iter()
+        .any(|entry| stored_source_matches(entry, &requested_source, &canonical_parent))
+    {
+        return Err(SelectError::SourceNotSelected {
+            input: source,
+            path: display_path(&manifest_path),
+        });
+    }
+
+    Ok(PreparedSourceRemoval {
+        manifest_path,
+        source: requested_source,
+        document,
+    })
+}
+
+fn removal_source_identity(source: &str) -> Result<SourceRepository, SelectError> {
+    if looks_like_repository_url(source) {
+        let github =
+            normalize_github_url(source).map_err(|error| SelectError::InvalidRemovalSource {
+                input: source.to_owned(),
+                details: error.to_string(),
+            })?;
+        return Ok(SourceRepository {
+            repository_type: "github",
+            path: github.identity,
+        });
+    }
+
+    let current_directory =
+        fs::canonicalize(".").map_err(|error| SelectError::InvalidRemovalSource {
+            input: source.to_owned(),
+            details: format!("could not resolve the current directory: {error}"),
+        })?;
+    Ok(SourceRepository {
+        repository_type: "local",
+        path: absolute_local_source_path(source, &current_directory),
+    })
+}
+
+fn listed_source(source: &Table, manifest_parent: &Path) -> ListedSourceRepository {
+    let repository_type = source["type"]
+        .as_str()
+        .expect("source type was validated as a string");
+    let stored_path = source["path"]
+        .as_str()
+        .expect("source path was validated as a string");
+    let source_path = if repository_type == "local" {
+        absolute_local_source_path(stored_path, manifest_parent)
+    } else {
+        stored_path.to_owned()
+    };
+    let mut skills = source["skills"]
+        .as_array()
+        .expect("source skills were validated as an array")
+        .iter()
+        .map(|skill| {
+            let path = skill
+                .as_str()
+                .expect("source skills were validated as strings")
+                .to_owned();
+            ListedSkill {
+                identity: SkillIdentity {
+                    source: source_path.clone(),
+                    path: path.clone(),
+                },
+                name: skill_name(&source_path, &path),
+                path,
+            }
+        })
+        .collect::<Vec<_>>();
+    skills.sort_by(|left, right| left.path.cmp(&right.path));
+    skills.dedup_by(|left, right| left.path == right.path);
+
+    ListedSourceRepository {
+        source: SourceRepository {
+            repository_type: match repository_type {
+                "local" => "local",
+                "github" => "github",
+                _ => unreachable!("source type was validated"),
+            },
+            path: source_path,
+        },
+        requested_revision: source["requested_revision"]
+            .as_str()
+            .expect("requested revision was validated as a string")
+            .to_owned(),
+        resolved_commit: source["resolved_commit"]
+            .as_str()
+            .expect("resolved commit was validated as a string")
+            .to_owned(),
+        skills,
+    }
+}
+
+fn skill_name(source_path: &str, skill_path: &str) -> String {
+    if skill_path == "." {
+        return Path::new(source_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(source_path)
+            .to_owned();
+    }
+
+    skill_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(skill_path)
+        .to_owned()
+}
+
 fn select_skills(
     discovery: &Discovery,
     selected_paths: impl IntoIterator<Item = String>,
@@ -419,7 +647,7 @@ fn persist_selection(
     manifest_path: PathBuf,
     skills: Vec<Skill>,
 ) -> Result<SkillSelection, SelectError> {
-    let (canonical_parent, mut document) = load_manifest(&manifest_path)?;
+    let (canonical_parent, mut document) = load_manifest(&manifest_path, true)?;
     let sources = document["sources"]
         .as_array_of_tables_mut()
         .expect("manifest sources were validated as an array of tables");
@@ -469,7 +697,7 @@ pub fn prepare_interactive_select(
     request: SelectRequest,
 ) -> Result<PreparedInteractiveSelection, SelectError> {
     let discovery = discover_with_options(request.discovery, true)?;
-    let (canonical_parent, document) = load_manifest(&request.manifest_path)?;
+    let (canonical_parent, document) = load_manifest(&request.manifest_path, true)?;
     let sources = document["sources"]
         .as_array_of_tables()
         .expect("manifest sources were validated as an array of tables");
@@ -545,7 +773,10 @@ where
         .map_err(InteractiveSelectError::Select)
 }
 
-fn load_manifest(manifest_path: &Path) -> Result<(PathBuf, DocumentMut), SelectError> {
+fn load_manifest(
+    manifest_path: &Path,
+    create_if_missing: bool,
+) -> Result<(PathBuf, DocumentMut), SelectError> {
     let manifest_parent = manifest_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -567,7 +798,7 @@ fn load_manifest(manifest_path: &Path) -> Result<(PathBuf, DocumentMut), SelectE
                     source,
                 })?
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        Err(error) if error.kind() == io::ErrorKind::NotFound && create_if_missing => {
             let mut document = DocumentMut::new();
             document["manifest_version"] = value(1);
             document["sources"] = Item::ArrayOfTables(ArrayOfTables::new());
@@ -622,6 +853,39 @@ fn manifest_source_path(source: &SourceRepository, manifest_parent: &Path) -> St
         .into_owned()
 }
 
+fn absolute_local_source_path(stored_path: &str, manifest_parent: &Path) -> String {
+    let stored_path = Path::new(stored_path);
+    let absolute = if stored_path.is_absolute() {
+        stored_path.to_owned()
+    } else {
+        manifest_parent.join(stored_path)
+    };
+    normalize_path_lexically(&absolute)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
 fn source_matches(table: &Table, source: &SourceRepository, manifest_parent: &Path) -> bool {
     if table.get("type").and_then(Item::as_str) != Some(source.repository_type) {
         return false;
@@ -640,6 +904,20 @@ fn source_matches(table: &Table, source: &SourceRepository, manifest_parent: &Pa
         manifest_parent.join(stored_path)
     };
     fs::canonicalize(stored_path).is_ok_and(|path| path == Path::new(&source.path))
+}
+
+fn stored_source_matches(table: &Table, source: &SourceRepository, manifest_parent: &Path) -> bool {
+    if table.get("type").and_then(Item::as_str) != Some(source.repository_type) {
+        return false;
+    }
+    let Some(stored_path) = table.get("path").and_then(Item::as_str) else {
+        return false;
+    };
+    if source.repository_type == "local" {
+        absolute_local_source_path(stored_path, manifest_parent) == source.path
+    } else {
+        normalize_github_url(stored_path).is_ok_and(|github| github.identity == source.path)
+    }
 }
 
 fn validate_sources(sources: &ArrayOfTables, manifest_path: &str) -> Result<(), SelectError> {

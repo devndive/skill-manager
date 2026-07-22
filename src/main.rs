@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand};
 use dialoguer::{Confirm, MultiSelect};
 use skill_manager::{
     DiscoverRequest, Discovery, InteractiveSelectionPrompt, SelectRequest, SkillSelection,
-    discover, install_cancellation_handler, select, select_interactively,
+    SkillSelectionList, discover, install_cancellation_handler, list_selections,
+    prepare_source_removal, select, select_interactively,
 };
 
 #[derive(Debug, Parser)]
@@ -48,6 +49,26 @@ enum Commands {
         /// Emit the versioned JSON schema.
         #[arg(long)]
         json: bool,
+    },
+    /// List persisted Skill Selections without accessing their Source Repositories.
+    List {
+        /// Skill Selection manifest to inspect.
+        #[arg(long, value_name = "FILE", default_value = "skills.toml")]
+        manifest: PathBuf,
+        /// Emit the versioned JSON schema.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a Source Repository from the Skill Selection manifest.
+    Remove {
+        /// Local path or public GitHub URL identifying the Source Repository.
+        source: String,
+        /// Skill Selection manifest to update.
+        #[arg(long, value_name = "FILE", default_value = "skills.toml")]
+        manifest: PathBuf,
+        /// Remove without interactive confirmation.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -127,9 +148,47 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Skill Selection unchanged.");
             }
         }
+        Commands::List { manifest, json } => {
+            let selections = list_selections(manifest)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&selections)?);
+            } else {
+                print_list_human(&selections);
+            }
+        }
+        Commands::Remove {
+            source,
+            manifest,
+            yes,
+        } => {
+            let removal = prepare_source_removal(source, manifest)?;
+            let confirmed = yes || confirm_source_removal(&removal.source().path)?;
+            if confirmed {
+                let removed = removal.confirm()?;
+                println!("Removed Source Repository: {}", removed.source.path);
+                println!("Manifest: {}", removed.manifest_path);
+            } else {
+                println!("Skill Selection unchanged.");
+            }
+        }
     }
 
     Ok(())
+}
+
+fn confirm_source_removal(source: &str) -> io::Result<bool> {
+    eprint!("Remove Source Repository '{source}' from the Skill Selection manifest? [y/N] ");
+    io::stderr().flush()?;
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+    match response.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "" | "n" | "no" => Ok(false),
+        response => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("expected 'y' or 'n', received '{response}'"),
+        )),
+    }
 }
 
 fn prompt_for_selection(
@@ -214,5 +273,21 @@ fn print_selection_human(skill_selection: &SkillSelection) {
     println!("Skill Selection:");
     for skill in &skill_selection.skills {
         println!("- {} ({})", skill.name, skill.path);
+    }
+}
+
+fn print_list_human(selections: &SkillSelectionList) {
+    println!("Manifest: {}", selections.manifest_path);
+    for (index, source) in selections.sources.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        println!("Source Repository: {}", source.source.path);
+        println!("Requested revision: {}", source.requested_revision);
+        println!("Resolved commit: {}", source.resolved_commit);
+        println!("Skills:");
+        for skill in &source.skills {
+            println!("- {} ({})", skill.name, skill.path);
+        }
     }
 }
