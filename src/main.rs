@@ -1,8 +1,7 @@
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use skill_manager::{DiscoverRequest, Discovery, discover};
+use skill_manager::{DiscoverRequest, Discovery, discover, install_cancellation_handler};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -13,10 +12,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Discover Skills in a local Source Repository.
+    /// Discover Skills in a local or public GitHub Source Repository.
     Discover {
-        /// Path to the local Source Repository.
-        local_source: PathBuf,
+        /// Local path or public GitHub URL for the Source Repository.
+        source: String,
         /// Branch, tag, or commit to inspect instead of HEAD.
         #[arg(long = "ref", value_name = "REVISION", allow_hyphen_values = true)]
         reference: Option<String>,
@@ -27,6 +26,11 @@ enum Commands {
 }
 
 fn main() -> ExitCode {
+    if let Err(error) = install_cancellation_handler() {
+        eprintln!("error: could not install cancellation handler: {error}");
+        return ExitCode::FAILURE;
+    }
+
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -39,11 +43,11 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Discover {
-            local_source,
+            source,
             reference,
             json,
         } => {
-            let mut request = DiscoverRequest::new(local_source);
+            let mut request = DiscoverRequest::new(source);
             if let Some(reference) = reference {
                 request = request.with_revision(reference);
             }

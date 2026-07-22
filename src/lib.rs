@@ -1,17 +1,61 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
+use tempfile::TempDir;
 use thiserror::Error;
+
+static CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 pub struct DiscoverRequest {
-    source: PathBuf,
+    source: DiscoverSource,
     revision: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub enum DiscoverSource {
+    Local(PathBuf),
+    Url(String),
+}
+
+impl From<PathBuf> for DiscoverSource {
+    fn from(source: PathBuf) -> Self {
+        Self::Local(source)
+    }
+}
+
+impl From<&Path> for DiscoverSource {
+    fn from(source: &Path) -> Self {
+        Self::Local(source.to_owned())
+    }
+}
+
+impl From<&PathBuf> for DiscoverSource {
+    fn from(source: &PathBuf) -> Self {
+        Self::Local(source.to_owned())
+    }
+}
+
+impl From<String> for DiscoverSource {
+    fn from(source: String) -> Self {
+        if source.contains("://") || source.starts_with("git@") {
+            Self::Url(source)
+        } else {
+            Self::Local(source.into())
+        }
+    }
+}
+
+impl From<&str> for DiscoverSource {
+    fn from(source: &str) -> Self {
+        source.to_owned().into()
+    }
+}
+
 impl DiscoverRequest {
-    pub fn new(source: impl Into<PathBuf>) -> Self {
+    pub fn new(source: impl Into<DiscoverSource>) -> Self {
         Self {
             source: source.into(),
             revision: None,
@@ -76,13 +120,53 @@ pub enum DiscoverError {
     InvalidRepositoryPath(String),
     #[error("Source Repository '{0}' has no tracked Skills at the requested revision")]
     NoSkills(String),
+    #[error("unsupported or malformed Source Repository URL '{url}': {details}")]
+    InvalidSourceUrl { url: String, details: String },
+    #[error(
+        "could not create a temporary repository for Source Repository '{repository}': {source}"
+    )]
+    TemporaryRepository {
+        repository: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "could not remove temporary repository data for Source Repository '{repository}': {source}"
+    )]
+    TemporaryCleanup {
+        repository: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("discovery was cancelled")]
+    Cancelled,
+}
+
+pub fn install_cancellation_handler() -> Result<(), ctrlc::Error> {
+    CANCELLATION_REQUESTED.store(false, Ordering::SeqCst);
+    ctrlc::set_handler(|| {
+        CANCELLATION_REQUESTED.store(true, Ordering::SeqCst);
+    })
 }
 
 pub fn discover(request: DiscoverRequest) -> Result<Discovery, DiscoverError> {
+    if cancellation_requested() {
+        return Err(DiscoverError::Cancelled);
+    }
     let requested_revision = request.revision.as_deref().unwrap_or("HEAD").to_owned();
-    let source = display_path(&request.source);
-    let repository_root = git_text(&request.source, ["rev-parse", "--show-toplevel"]).map_err(
-        |error| match error {
+    match request.source {
+        DiscoverSource::Local(source) => discover_local(source, requested_revision),
+        DiscoverSource::Url(source) => discover_github(source, requested_revision),
+    }
+}
+
+fn discover_local(
+    source_path: PathBuf,
+    requested_revision: String,
+) -> Result<Discovery, DiscoverError> {
+    let source = display_path(&source_path);
+    let repository_root =
+        git_text(&source_path, ["rev-parse", "--show-toplevel"]).map_err(|error| match error {
             GitFailure::Unavailable(error) => DiscoverError::GitUnavailable(error),
             GitFailure::Failed(details) => DiscoverError::RepositoryUnavailable {
                 repository: source.clone(),
@@ -91,33 +175,115 @@ pub fn discover(request: DiscoverRequest) -> Result<Discovery, DiscoverError> {
             GitFailure::InvalidUtf8 => DiscoverError::InvalidGitOutput {
                 operation: "locating the Source Repository",
             },
-        },
-    )?;
+            GitFailure::Cancelled => DiscoverError::Cancelled,
+        })?;
     let repository_root = PathBuf::from(repository_root);
-    let revision_expression = format!("{requested_revision}^{{commit}}");
-    let resolved_commit = git_text(
+    let repository_path = repository_root
+        .to_str()
+        .ok_or_else(|| {
+            DiscoverError::InvalidRepositoryPath(display_path(repository_root.as_path()))
+        })?
+        .to_owned();
+    let repository_name = repository_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            DiscoverError::InvalidRepositoryPath(display_path(repository_root.as_path()))
+        })?
+        .to_owned();
+
+    discover_repository(
         &repository_root,
-        [
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            revision_expression.as_str(),
-        ],
+        "local",
+        repository_path,
+        repository_name,
+        requested_revision,
+        false,
     )
-    .map_err(|error| match error {
-        GitFailure::Unavailable(error) => DiscoverError::GitUnavailable(error),
-        GitFailure::Failed(details) => DiscoverError::RevisionUnavailable {
-            repository: source.clone(),
-            revision: requested_revision.clone(),
-            details,
-        },
-        GitFailure::InvalidUtf8 => DiscoverError::InvalidGitOutput {
-            operation: "resolving the requested revision",
-        },
+}
+
+fn discover_github(
+    source_url: String,
+    requested_revision: String,
+) -> Result<Discovery, DiscoverError> {
+    let github = normalize_github_url(&source_url)?;
+    let temporary = TempDir::new().map_err(|source| DiscoverError::TemporaryRepository {
+        repository: github.identity.clone(),
+        source,
     })?;
+    let repository_root = temporary.path().join("repository.git");
+    let result = Command::new("git")
+        .args(["clone", "--filter=blob:none", "--no-checkout", "--quiet"])
+        .arg(&github.identity)
+        .arg(&repository_root)
+        .output()
+        .map_err(DiscoverError::GitUnavailable)
+        .and_then(|output| {
+            if cancellation_requested() {
+                Err(DiscoverError::Cancelled)
+            } else if output.status.success() {
+                Ok(())
+            } else {
+                Err(DiscoverError::RepositoryUnavailable {
+                    repository: github.identity.clone(),
+                    details: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                })
+            }
+        })
+        .and_then(|()| {
+            discover_repository(
+                &repository_root,
+                "github",
+                github.identity.clone(),
+                github.repository_name,
+                requested_revision,
+                true,
+            )
+        })
+        .and_then(|discovery| {
+            if cancellation_requested() {
+                Err(DiscoverError::Cancelled)
+            } else {
+                Ok(discovery)
+            }
+        });
+    let cleanup = temporary.close();
+    match (result, cleanup) {
+        (Ok(discovery), Ok(())) => Ok(discovery),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(source)) => Err(DiscoverError::TemporaryCleanup {
+            repository: github.identity,
+            source,
+        }),
+    }
+}
+
+fn discover_repository(
+    repository_root: &Path,
+    repository_type: &'static str,
+    source: String,
+    repository_name: String,
+    requested_revision: String,
+    resolve_remote_branch: bool,
+) -> Result<Discovery, DiscoverError> {
+    let resolved_commit =
+        resolve_commit(repository_root, &requested_revision, resolve_remote_branch).map_err(
+            |error| match error {
+                GitFailure::Unavailable(error) => DiscoverError::GitUnavailable(error),
+                GitFailure::Failed(details) => DiscoverError::RevisionUnavailable {
+                    repository: source.clone(),
+                    revision: requested_revision.clone(),
+                    details,
+                },
+                GitFailure::InvalidUtf8 => DiscoverError::InvalidGitOutput {
+                    operation: "resolving the requested revision",
+                },
+                GitFailure::Cancelled => DiscoverError::Cancelled,
+            },
+        )?;
 
     let tree = git_bytes(
-        &repository_root,
+        repository_root,
         [
             "ls-tree",
             "-r",
@@ -134,20 +300,9 @@ pub fn discover(request: DiscoverRequest) -> Result<Discovery, DiscoverError> {
             details,
         },
         GitFailure::InvalidUtf8 => unreachable!("raw Git output does not decode text"),
+        GitFailure::Cancelled => DiscoverError::Cancelled,
     })?;
 
-    let repository_path = repository_root
-        .to_str()
-        .ok_or_else(|| {
-            DiscoverError::InvalidRepositoryPath(display_path(repository_root.as_path()))
-        })?
-        .to_owned();
-    let repository_name = repository_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            DiscoverError::InvalidRepositoryPath(display_path(repository_root.as_path()))
-        })?;
     let mut skill_paths = Vec::new();
     for entry in tree
         .split(|byte| *byte == 0)
@@ -206,14 +361,14 @@ pub fn discover(request: DiscoverRequest) -> Result<Discovery, DiscoverError> {
                 .max_by_key(|candidate| candidate.len())
                 .cloned();
             let name = if path == "." {
-                repository_name.to_owned()
+                repository_name.clone()
             } else {
                 path.rsplit('/').next().unwrap_or(path).to_owned()
             };
 
             Skill {
                 identity: SkillIdentity {
-                    source: repository_path.clone(),
+                    source: source.clone(),
                     path: path.clone(),
                 },
                 name,
@@ -226,8 +381,8 @@ pub fn discover(request: DiscoverRequest) -> Result<Discovery, DiscoverError> {
     Ok(Discovery {
         schema_version: 1,
         source: SourceRepository {
-            repository_type: "local",
-            path: repository_path,
+            repository_type,
+            path: source,
         },
         requested_revision,
         resolved_commit,
@@ -235,10 +390,123 @@ pub fn discover(request: DiscoverRequest) -> Result<Discovery, DiscoverError> {
     })
 }
 
+fn resolve_commit(
+    repository: &Path,
+    requested_revision: &str,
+    resolve_remote_branch: bool,
+) -> Result<String, GitFailure> {
+    let revision_expression = format!("{requested_revision}^{{commit}}");
+    match git_text(
+        repository,
+        [
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            revision_expression.as_str(),
+        ],
+    ) {
+        Err(GitFailure::Failed(_)) if resolve_remote_branch && requested_revision != "HEAD" => {
+            let remote_expression = format!("refs/remotes/origin/{requested_revision}^{{commit}}");
+            git_text(
+                repository,
+                [
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    remote_expression.as_str(),
+                ],
+            )
+        }
+        result => result,
+    }
+}
+
+struct GitHubRepository {
+    identity: String,
+    repository_name: String,
+}
+
+fn normalize_github_url(source: &str) -> Result<GitHubRepository, DiscoverError> {
+    let Some((scheme, remainder)) = source.split_once("://") else {
+        return Err(invalid_source_url(
+            source,
+            "expected an https:// GitHub URL",
+        ));
+    };
+    if !scheme.eq_ignore_ascii_case("https") {
+        return Err(invalid_source_url(
+            source,
+            "only public https://github.com URLs are supported",
+        ));
+    }
+    let Some((host, path)) = remainder.split_once('/') else {
+        return Err(invalid_source_url(
+            source,
+            "expected an owner and repository name",
+        ));
+    };
+    if !host.eq_ignore_ascii_case("github.com") {
+        return Err(invalid_source_url(
+            source,
+            "only public github.com repositories are supported",
+        ));
+    }
+    if path.contains(['?', '#']) {
+        return Err(invalid_source_url(
+            source,
+            "query strings and fragments are not supported",
+        ));
+    }
+
+    let path = path.trim_end_matches('/');
+    let path = path
+        .strip_suffix(".git")
+        .or_else(|| path.strip_suffix(".GIT"))
+        .unwrap_or(path);
+    let mut segments = path.split('/');
+    let owner = segments.next().unwrap_or_default();
+    let repository = segments.next().unwrap_or_default();
+    if owner.is_empty() || repository.is_empty() || segments.next().is_some() {
+        return Err(invalid_source_url(
+            source,
+            "expected exactly one owner and repository name",
+        ));
+    }
+    if !is_github_name(owner, false) || !is_github_name(repository, true) {
+        return Err(invalid_source_url(
+            source,
+            "owner or repository name contains unsupported characters",
+        ));
+    }
+
+    let owner = owner.to_ascii_lowercase();
+    let repository_name = repository.to_ascii_lowercase();
+    Ok(GitHubRepository {
+        identity: format!("https://github.com/{owner}/{repository_name}"),
+        repository_name,
+    })
+}
+
+fn is_github_name(value: &str, allow_dot_and_underscore: bool) -> bool {
+    value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || byte == b'-'
+            || (allow_dot_and_underscore && matches!(byte, b'.' | b'_'))
+    })
+}
+
+fn invalid_source_url(source: &str, details: &str) -> DiscoverError {
+    DiscoverError::InvalidSourceUrl {
+        url: source.to_owned(),
+        details: details.to_owned(),
+    }
+}
+
 enum GitFailure {
     Unavailable(std::io::Error),
     Failed(String),
     InvalidUtf8,
+    Cancelled,
 }
 
 fn git_text<const N: usize>(repository: &Path, arguments: [&str; N]) -> Result<String, GitFailure> {
@@ -252,6 +520,9 @@ fn git_bytes<const N: usize>(
     arguments: [&str; N],
 ) -> Result<Vec<u8>, GitFailure> {
     let output = run_git(repository, arguments).map_err(GitFailure::Unavailable)?;
+    if cancellation_requested() {
+        return Err(GitFailure::Cancelled);
+    }
     if !output.status.success() {
         return Err(GitFailure::Failed(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -259,6 +530,10 @@ fn git_bytes<const N: usize>(
     }
 
     Ok(output.stdout)
+}
+
+fn cancellation_requested() -> bool {
+    CANCELLATION_REQUESTED.load(Ordering::SeqCst)
 }
 
 fn run_git<const N: usize>(repository: &Path, arguments: [&str; N]) -> std::io::Result<Output> {
