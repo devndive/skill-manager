@@ -1,6 +1,9 @@
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use serde::Serialize;
 use tempfile::TempDir;
@@ -219,12 +222,16 @@ fn discover_github(
         source,
     })?;
     let repository_root = temporary.path().join("repository.git");
-    let result = Command::new("git")
+    let mut clone = Command::new("git");
+    clone
         .args(["clone", "--filter=blob:none", "--no-checkout", "--quiet"])
         .arg(&github.identity)
-        .arg(&repository_root)
-        .output()
-        .map_err(DiscoverError::GitUnavailable)
+        .arg(&repository_root);
+    let result = run_command(&mut clone)
+        .map_err(|error| match error {
+            CommandExecutionError::Unavailable(error) => DiscoverError::GitUnavailable(error),
+            CommandExecutionError::Cancelled => DiscoverError::Cancelled,
+        })
         .and_then(|output| {
             if cancellation_requested() {
                 Err(DiscoverError::Cancelled)
@@ -279,17 +286,13 @@ fn discover_repository(
         &requested_revision,
         context.resolve_remote_branch,
     )
-    .map_err(|error| match error {
-        GitFailure::Unavailable(error) => DiscoverError::GitUnavailable(error),
-        GitFailure::Failed(details) => DiscoverError::RevisionUnavailable {
-            repository: context.identity.clone(),
-            revision: requested_revision.clone(),
-            details,
-        },
-        GitFailure::InvalidUtf8 => DiscoverError::InvalidGitOutput {
-            operation: "resolving the requested revision",
-        },
-        GitFailure::Cancelled => DiscoverError::Cancelled,
+    .map_err(|error| {
+        revision_error(
+            error,
+            &context.identity,
+            &requested_revision,
+            "resolving the requested revision",
+        )
     })?;
 
     let tree = git_bytes(
@@ -302,15 +305,13 @@ fn discover_repository(
             resolved_commit.as_str(),
         ],
     )
-    .map_err(|error| match error {
-        GitFailure::Unavailable(error) => DiscoverError::GitUnavailable(error),
-        GitFailure::Failed(details) => DiscoverError::RevisionUnavailable {
-            repository: context.identity.clone(),
-            revision: requested_revision.clone(),
-            details,
-        },
-        GitFailure::InvalidUtf8 => unreachable!("raw Git output does not decode text"),
-        GitFailure::Cancelled => DiscoverError::Cancelled,
+    .map_err(|error| {
+        revision_error(
+            error,
+            &context.identity,
+            &requested_revision,
+            "reading the requested repository tree",
+        )
     })?;
 
     let mut skill_paths = Vec::new();
@@ -405,6 +406,24 @@ struct RepositoryContext {
     identity: String,
     name: String,
     resolve_remote_branch: bool,
+}
+
+fn revision_error(
+    error: GitFailure,
+    repository: &str,
+    revision: &str,
+    operation: &'static str,
+) -> DiscoverError {
+    match error {
+        GitFailure::Unavailable(error) => DiscoverError::GitUnavailable(error),
+        GitFailure::Failed(details) => DiscoverError::RevisionUnavailable {
+            repository: repository.to_owned(),
+            revision: revision.to_owned(),
+            details,
+        },
+        GitFailure::InvalidUtf8 => DiscoverError::InvalidGitOutput { operation },
+        GitFailure::Cancelled => DiscoverError::Cancelled,
+    }
 }
 
 fn resolve_commit(
@@ -536,6 +555,11 @@ enum GitFailure {
     Cancelled,
 }
 
+enum CommandExecutionError {
+    Unavailable(io::Error),
+    Cancelled,
+}
+
 fn git_text<const N: usize>(repository: &Path, arguments: [&str; N]) -> Result<String, GitFailure> {
     String::from_utf8(git_bytes(repository, arguments)?)
         .map(strip_line_ending)
@@ -546,10 +570,7 @@ fn git_bytes<const N: usize>(
     repository: &Path,
     arguments: [&str; N],
 ) -> Result<Vec<u8>, GitFailure> {
-    let output = run_git(repository, arguments).map_err(GitFailure::Unavailable)?;
-    if cancellation_requested() {
-        return Err(GitFailure::Cancelled);
-    }
+    let output = run_git(repository, arguments)?;
     if !output.status.success() {
         return Err(GitFailure::Failed(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -563,12 +584,103 @@ fn cancellation_requested() -> bool {
     CANCELLATION_REQUESTED.load(Ordering::SeqCst)
 }
 
-fn run_git<const N: usize>(repository: &Path, arguments: [&str; N]) -> std::io::Result<Output> {
-    Command::new("git")
-        .arg("-C")
-        .arg(repository)
-        .args(arguments)
-        .output()
+fn run_git<const N: usize>(repository: &Path, arguments: [&str; N]) -> Result<Output, GitFailure> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repository).args(arguments);
+    run_command(&mut command).map_err(|error| match error {
+        CommandExecutionError::Unavailable(error) => GitFailure::Unavailable(error),
+        CommandExecutionError::Cancelled => GitFailure::Cancelled,
+    })
+}
+
+fn run_command(command: &mut Command) -> Result<Output, CommandExecutionError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_process_group(command);
+    let mut child = command
+        .spawn()
+        .map_err(CommandExecutionError::Unavailable)?;
+    let stdout = child.stdout.take().expect("stdout is configured as piped");
+    let stderr = child.stderr.take().expect("stderr is configured as piped");
+    let stdout_reader = thread::spawn(move || read_all(stdout));
+    let stderr_reader = thread::spawn(move || read_all(stderr));
+
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(CommandExecutionError::Unavailable)?
+        {
+            break status;
+        }
+        if cancellation_requested() {
+            terminate_child(&mut child).map_err(CommandExecutionError::Unavailable)?;
+            child.wait().map_err(CommandExecutionError::Unavailable)?;
+            join_reader(stdout_reader)?;
+            join_reader(stderr_reader)?;
+            return Err(CommandExecutionError::Cancelled);
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    let output = Output {
+        status,
+        stdout: join_reader(stdout_reader)?,
+        stderr: join_reader(stderr_reader)?,
+    };
+    if cancellation_requested() {
+        Err(CommandExecutionError::Cancelled)
+    } else {
+        Ok(output)
+    }
+}
+
+fn read_all(mut reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+fn join_reader(
+    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>, CommandExecutionError> {
+    reader
+        .join()
+        .map_err(|_| {
+            CommandExecutionError::Unavailable(io::Error::other(
+                "Git output reader thread panicked",
+            ))
+        })?
+        .map_err(CommandExecutionError::Unavailable)
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_child(child: &mut Child) -> io::Result<()> {
+    // Each Git child is the leader of the dedicated process group created above.
+    let result = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_child(child: &mut Child) -> io::Result<()> {
+    child.kill()
 }
 
 fn display_path(path: &Path) -> String {

@@ -124,7 +124,7 @@ if [ "$1" = "clone" ]; then
   fi
   if [ -n "$SKILL_MANAGER_TEST_SIGNAL" ]; then
     kill -"$SKILL_MANAGER_TEST_SIGNAL" "$PPID"
-    sleep 0.1
+    sleep 5
     exit 130
   fi
   exec "$SKILL_MANAGER_TEST_REAL_GIT" clone --no-checkout --quiet "$SKILL_MANAGER_TEST_REMOTE" "$destination"

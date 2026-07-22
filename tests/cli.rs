@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tempfile::TempDir;
@@ -262,6 +263,7 @@ fn cli_cleans_the_temporary_clone_when_remote_discovery_is_cancelled() {
         let lock = git_environment_lock();
         let fake_github = common::FakeGitHub::signal_clone(signal, lock);
 
+        let started = Instant::now();
         let output = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
             .args([
                 "discover",
@@ -271,6 +273,7 @@ fn cli_cleans_the_temporary_clone_when_remote_discovery_is_cancelled() {
             .output()
             .unwrap();
 
+        assert!(started.elapsed() < Duration::from_secs(2));
         assert!(!output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
         assert!(
