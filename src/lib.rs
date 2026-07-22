@@ -678,7 +678,32 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn terminate_child(child: &mut Child) -> io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+
+    let process_id = child.id().to_string();
+    let status = Command::new("taskkill")
+        .args(["/PID", process_id.as_str(), "/T", "/F"])
+        .status();
+    if status.is_ok_and(|status| status.success()) {
+        return Ok(());
+    }
+
+    let error = match child.kill() {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if child.try_wait()?.is_some() {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn terminate_child(child: &mut Child) -> io::Result<()> {
     child.kill()
 }
