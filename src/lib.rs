@@ -279,8 +279,10 @@ impl PreparedSourceRemoval {
             }
         }
 
-        ensure_selection_not_cancelled()?;
-        write_manifest_atomic(&self.manifest_path, self.document.to_string().as_bytes())?;
+        write_manifest_atomic_for_removal(
+            &self.manifest_path,
+            self.document.to_string().as_bytes(),
+        )?;
 
         Ok(RemovedSourceRepository {
             manifest_path: display_path(&self.manifest_path),
@@ -414,6 +416,8 @@ pub enum SelectError {
     InvalidRemovalSource { input: String, details: String },
     #[error("Source Repository '{input}' is not selected in manifest '{path}'")]
     SourceNotSelected { input: String, path: String },
+    #[error("removal was cancelled")]
+    RemovalCancelled,
 }
 
 #[derive(Debug, Error)]
@@ -577,7 +581,6 @@ fn listed_source(source: &Table, manifest_parent: &Path) -> ListedSourceReposito
         })
         .collect::<Vec<_>>();
     skills.sort_by(|left, right| left.path.cmp(&right.path));
-    skills.dedup_by(|left, right| left.path == right.path);
 
     ListedSourceRepository {
         source: SourceRepository {
@@ -1051,7 +1054,22 @@ fn set_table_value(table: &mut Table, key: &str, mut new_value: Value) {
 }
 
 fn write_manifest_atomic(manifest_path: &Path, contents: &[u8]) -> Result<(), SelectError> {
-    ensure_selection_not_cancelled()?;
+    write_manifest_atomic_with_cancellation(manifest_path, contents, ensure_selection_not_cancelled)
+}
+
+fn write_manifest_atomic_for_removal(
+    manifest_path: &Path,
+    contents: &[u8],
+) -> Result<(), SelectError> {
+    write_manifest_atomic_with_cancellation(manifest_path, contents, ensure_removal_not_cancelled)
+}
+
+fn write_manifest_atomic_with_cancellation(
+    manifest_path: &Path,
+    contents: &[u8],
+    ensure_not_cancelled: fn() -> Result<(), SelectError>,
+) -> Result<(), SelectError> {
+    ensure_not_cancelled()?;
     let parent = manifest_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -1069,7 +1087,7 @@ fn write_manifest_atomic(manifest_path: &Path, contents: &[u8]) -> Result<(), Se
             path: manifest.clone(),
             source,
         })?;
-    ensure_selection_not_cancelled()?;
+    ensure_not_cancelled()?;
     temporary
         .persist(manifest_path)
         .map_err(|error| SelectError::ManifestWrite {
@@ -1077,6 +1095,14 @@ fn write_manifest_atomic(manifest_path: &Path, contents: &[u8]) -> Result<(), Se
             source: error.error,
         })?;
     Ok(())
+}
+
+fn ensure_removal_not_cancelled() -> Result<(), SelectError> {
+    if cancellation_requested() {
+        Err(SelectError::RemovalCancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn ensure_selection_not_cancelled() -> Result<(), SelectError> {

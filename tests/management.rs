@@ -369,7 +369,7 @@ fn cli_cancelled_removal_leaves_the_manifest_unchanged() {
     assert!(!output.status.success());
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("discovery was cancelled"), "{stderr}");
+    assert!(stderr.contains("removal was cancelled"), "{stderr}");
     assert_eq!(fs::read_to_string(manifest_path).unwrap(), original);
 }
 
