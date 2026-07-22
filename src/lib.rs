@@ -215,6 +215,86 @@ pub struct SkillSelection {
     pub skills: Vec<Skill>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveSkillOption {
+    pub name: String,
+    pub path: String,
+    pub parent_path: Option<String>,
+    pub nesting_depth: usize,
+    pub preselected: bool,
+}
+
+impl InteractiveSkillOption {
+    pub fn terminal_label(&self) -> String {
+        let indentation = "  ".repeat(self.nesting_depth);
+        if let Some(parent_path) = &self.parent_path {
+            format!(
+                "{indentation}{} ({}; parent: {parent_path})",
+                self.name, self.path
+            )
+        } else {
+            format!("{indentation}{} ({})", self.name, self.path)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveSelectionPrompt {
+    pub options: Vec<InteractiveSkillOption>,
+    pub missing_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillOverlap {
+    pub parent_path: String,
+    pub nested_path: String,
+}
+
+impl InteractiveSelectionPrompt {
+    pub fn overlaps(&self, selected_paths: &[String]) -> Vec<SkillOverlap> {
+        let selected_paths = selected_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        self.options
+            .iter()
+            .filter(|parent| selected_paths.contains(parent.path.as_str()))
+            .flat_map(|parent| {
+                self.options
+                    .iter()
+                    .filter(|nested| selected_paths.contains(nested.path.as_str()))
+                    .filter(|nested| parent.path != nested.path)
+                    .filter(|nested| contains_path(&parent.path, &nested.path))
+                    .map(|nested| SkillOverlap {
+                        parent_path: parent.path.clone(),
+                        nested_path: nested.path.clone(),
+                    })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedInteractiveSelection {
+    prompt: InteractiveSelectionPrompt,
+    discovery: Discovery,
+    manifest_path: PathBuf,
+}
+
+impl PreparedInteractiveSelection {
+    pub fn prompt(&self) -> &InteractiveSelectionPrompt {
+        &self.prompt
+    }
+
+    pub fn confirm(
+        self,
+        selected_paths: impl IntoIterator<Item = String>,
+    ) -> Result<SkillSelection, SelectError> {
+        let skills = select_skills(&self.discovery, selected_paths)?;
+        persist_selection(self.discovery, self.manifest_path, skills)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SelectError {
     #[error(transparent)]
@@ -258,6 +338,17 @@ pub enum SelectError {
     },
 }
 
+#[derive(Debug, Error)]
+pub enum InteractiveSelectError<E>
+where
+    E: std::error::Error + 'static,
+{
+    #[error(transparent)]
+    Select(#[from] SelectError),
+    #[error("interactive selection failed: {0}")]
+    Interaction(#[source] E),
+}
+
 pub fn install_cancellation_handler() -> Result<(), ctrlc::Error> {
     CANCELLATION_REQUESTED.store(false, Ordering::SeqCst);
     ctrlc::set_handler(|| {
@@ -291,93 +382,47 @@ pub fn select(request: SelectRequest) -> Result<SkillSelection, SelectError> {
     ensure_selection_not_cancelled()?;
     let skills = match request.selection {
         RequestedSkillSelection::All => discovery.skills.clone(),
-        RequestedSkillSelection::Paths(paths) => {
-            let paths = paths.into_iter().collect::<BTreeSet<_>>();
-            let discovered_paths = discovery
-                .skills
-                .iter()
-                .map(|skill| skill.path.as_str())
-                .collect::<BTreeSet<_>>();
-            let missing = paths
-                .iter()
-                .filter(|path| !discovered_paths.contains(path.as_str()))
-                .cloned()
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                return Err(SelectError::InvalidSelection {
-                    repository: discovery.source.path.clone(),
-                    paths: missing,
-                });
-            }
-            discovery
-                .skills
-                .iter()
-                .filter(|skill| paths.contains(&skill.path))
-                .cloned()
-                .collect()
-        }
+        RequestedSkillSelection::Paths(paths) => select_skills(&discovery, paths)?,
     };
-    let manifest_parent = request
-        .manifest_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let canonical_parent =
-        fs::canonicalize(manifest_parent).map_err(|source| SelectError::ManifestDirectory {
-            path: display_path(manifest_parent),
-            source,
-        })?;
 
-    ensure_selection_not_cancelled()?;
-    let manifest_display = display_path(&request.manifest_path);
-    let mut document = match fs::read_to_string(&request.manifest_path) {
-        Ok(contents) => {
-            contents
-                .parse::<DocumentMut>()
-                .map_err(|source| SelectError::ManifestParse {
-                    path: manifest_display.clone(),
-                    source,
-                })?
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut document = DocumentMut::new();
-            document["manifest_version"] = value(1);
-            document["sources"] = Item::ArrayOfTables(ArrayOfTables::new());
-            document
-        }
-        Err(source) => {
-            return Err(SelectError::ManifestRead {
-                path: manifest_display,
-                source,
-            });
-        }
-    };
-    match document.get("manifest_version").and_then(Item::as_integer) {
-        Some(1) => {}
-        Some(version) => {
-            return Err(SelectError::UnsupportedManifestVersion {
-                path: display_path(&request.manifest_path),
-                version,
-            });
-        }
-        None => {
-            return Err(SelectError::InvalidManifest {
-                path: display_path(&request.manifest_path),
-                details: "missing integer 'manifest_version'".to_owned(),
-            });
-        }
+    persist_selection(discovery, request.manifest_path, skills)
+}
+
+fn select_skills(
+    discovery: &Discovery,
+    selected_paths: impl IntoIterator<Item = String>,
+) -> Result<Vec<Skill>, SelectError> {
+    let paths = selected_paths.into_iter().collect::<BTreeSet<_>>();
+    let discovered_paths = discovered_skill_paths(discovery);
+    let missing = paths
+        .iter()
+        .filter(|path| !discovered_paths.contains(path.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(SelectError::InvalidSelection {
+            repository: discovery.source.path.clone(),
+            paths: missing,
+        });
     }
-    if document.get("sources").is_none() {
-        document["sources"] = Item::ArrayOfTables(ArrayOfTables::new());
-    }
-    let manifest_path = display_path(&request.manifest_path);
+
+    Ok(discovery
+        .skills
+        .iter()
+        .filter(|skill| paths.contains(&skill.path))
+        .cloned()
+        .collect())
+}
+
+fn persist_selection(
+    discovery: Discovery,
+    manifest_path: PathBuf,
+    skills: Vec<Skill>,
+) -> Result<SkillSelection, SelectError> {
+    let (canonical_parent, mut document) = load_manifest(&manifest_path)?;
     let sources = document["sources"]
         .as_array_of_tables_mut()
-        .ok_or_else(|| SelectError::InvalidManifest {
-            path: manifest_path.clone(),
-            details: "'sources' must be an array of tables".to_owned(),
-        })?;
-    validate_sources(sources, &manifest_path)?;
+        .expect("manifest sources were validated as an array of tables");
     let matching_source_indices = sources
         .iter()
         .enumerate()
@@ -408,16 +453,161 @@ pub fn select(request: SelectRequest) -> Result<SkillSelection, SelectError> {
     }
 
     ensure_selection_not_cancelled()?;
-    write_manifest_atomic(&request.manifest_path, document.to_string().as_bytes())?;
+    write_manifest_atomic(&manifest_path, document.to_string().as_bytes())?;
 
     Ok(SkillSelection {
         schema_version: 1,
-        manifest_path: display_path(&request.manifest_path),
+        manifest_path: display_path(&manifest_path),
         source: discovery.source,
         requested_revision: discovery.requested_revision,
         resolved_commit: discovery.resolved_commit,
         skills,
     })
+}
+
+pub fn prepare_interactive_select(
+    request: SelectRequest,
+) -> Result<PreparedInteractiveSelection, SelectError> {
+    let discovery = discover_with_options(request.discovery, true)?;
+    let (canonical_parent, document) = load_manifest(&request.manifest_path)?;
+    let sources = document["sources"]
+        .as_array_of_tables()
+        .expect("manifest sources were validated as an array of tables");
+    let selected_paths = sources
+        .iter()
+        .filter(|source| source_matches(source, &discovery.source, &canonical_parent))
+        .flat_map(|source| {
+            source["skills"]
+                .as_array()
+                .expect("source skills were validated as an array")
+                .iter()
+                .map(|skill| {
+                    skill
+                        .as_str()
+                        .expect("source skills were validated as strings")
+                        .to_owned()
+                })
+        })
+        .collect::<BTreeSet<_>>();
+    let discovered_paths = discovered_skill_paths(&discovery);
+    let options = discovery
+        .skills
+        .iter()
+        .map(|skill| InteractiveSkillOption {
+            name: skill.name.clone(),
+            path: skill.path.clone(),
+            parent_path: skill.parent_path.clone(),
+            nesting_depth: discovery
+                .skills
+                .iter()
+                .filter(|candidate| candidate.path != skill.path)
+                .filter(|candidate| contains_path(&candidate.path, &skill.path))
+                .count(),
+            preselected: selected_paths.contains(&skill.path),
+        })
+        .collect();
+    let missing_paths = selected_paths
+        .into_iter()
+        .filter(|path| !discovered_paths.contains(path.as_str()))
+        .collect();
+
+    Ok(PreparedInteractiveSelection {
+        prompt: InteractiveSelectionPrompt {
+            options,
+            missing_paths,
+        },
+        discovery,
+        manifest_path: request.manifest_path,
+    })
+}
+
+fn discovered_skill_paths(discovery: &Discovery) -> BTreeSet<&str> {
+    discovery
+        .skills
+        .iter()
+        .map(|skill| skill.path.as_str())
+        .collect()
+}
+
+pub fn select_interactively<E>(
+    request: SelectRequest,
+    interact: impl FnOnce(&InteractiveSelectionPrompt) -> Result<Option<Vec<String>>, E>,
+) -> Result<Option<SkillSelection>, InteractiveSelectError<E>>
+where
+    E: std::error::Error + 'static,
+{
+    let prepared_selection = prepare_interactive_select(request)?;
+    let selected_paths =
+        interact(prepared_selection.prompt()).map_err(InteractiveSelectError::Interaction)?;
+    selected_paths
+        .map(|selected_paths| prepared_selection.confirm(selected_paths))
+        .transpose()
+        .map_err(InteractiveSelectError::Select)
+}
+
+fn load_manifest(manifest_path: &Path) -> Result<(PathBuf, DocumentMut), SelectError> {
+    let manifest_parent = manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent =
+        fs::canonicalize(manifest_parent).map_err(|source| SelectError::ManifestDirectory {
+            path: display_path(manifest_parent),
+            source,
+        })?;
+
+    ensure_selection_not_cancelled()?;
+    let manifest_display = display_path(manifest_path);
+    let mut document = match fs::read_to_string(manifest_path) {
+        Ok(contents) => {
+            contents
+                .parse::<DocumentMut>()
+                .map_err(|source| SelectError::ManifestParse {
+                    path: manifest_display.clone(),
+                    source,
+                })?
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut document = DocumentMut::new();
+            document["manifest_version"] = value(1);
+            document["sources"] = Item::ArrayOfTables(ArrayOfTables::new());
+            document
+        }
+        Err(source) => {
+            return Err(SelectError::ManifestRead {
+                path: manifest_display,
+                source,
+            });
+        }
+    };
+    match document.get("manifest_version").and_then(Item::as_integer) {
+        Some(1) => {}
+        Some(version) => {
+            return Err(SelectError::UnsupportedManifestVersion {
+                path: display_path(manifest_path),
+                version,
+            });
+        }
+        None => {
+            return Err(SelectError::InvalidManifest {
+                path: display_path(manifest_path),
+                details: "missing integer 'manifest_version'".to_owned(),
+            });
+        }
+    }
+    if document.get("sources").is_none() {
+        document["sources"] = Item::ArrayOfTables(ArrayOfTables::new());
+    }
+    let manifest_display = display_path(manifest_path);
+    let sources = document["sources"]
+        .as_array_of_tables_mut()
+        .ok_or_else(|| SelectError::InvalidManifest {
+            path: manifest_display.clone(),
+            details: "'sources' must be an array of tables".to_owned(),
+        })?;
+    validate_sources(sources, &manifest_display)?;
+
+    Ok((canonical_parent, document))
 }
 
 fn manifest_source_path(source: &SourceRepository, manifest_parent: &Path) -> String {

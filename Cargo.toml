@@ -16,6 +16,7 @@ tempfile = "3.20"
 thiserror = "2.0"
 toml_edit = "0.22"
 pathdiff = "0.2"
+dialoguer = { version = "0.11", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

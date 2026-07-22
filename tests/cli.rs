@@ -415,6 +415,38 @@ fn cli_invalid_selection_writes_only_a_diagnostic_and_keeps_the_manifest() {
     assert_eq!(fs::read_to_string(manifest_path).unwrap(), original);
 }
 
+#[test]
+fn cli_requires_a_terminal_when_no_non_interactive_selection_is_supplied() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("kept/SKILL.md", "# Kept\n");
+    repository.commit("add skill");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    let original = "# existing manifest\nmanifest_version = 1\nsources = []\n";
+    fs::write(&manifest_path, original).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
+        .args([
+            "select",
+            repository.path().to_str().unwrap(),
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("interactive selection requires a terminal")
+    );
+    assert_eq!(fs::read_to_string(manifest_path).unwrap(), original);
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_cancelled_selection_does_not_create_a_manifest() {

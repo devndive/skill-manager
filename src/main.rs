@@ -1,10 +1,12 @@
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use dialoguer::{Confirm, MultiSelect};
 use skill_manager::{
-    DiscoverRequest, Discovery, SelectRequest, SkillSelection, discover,
-    install_cancellation_handler, select,
+    DiscoverRequest, Discovery, InteractiveSelectionPrompt, SelectRequest, SkillSelection,
+    discover, install_cancellation_handler, select, select_interactively,
 };
 
 #[derive(Debug, Parser)]
@@ -95,6 +97,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(reference) = reference {
                 request = request.with_revision(reference);
             }
+            let interactive = !all && selected_paths.is_empty();
             if all {
                 request = request.select_all();
             } else {
@@ -102,17 +105,86 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     request = request.select_path(path);
                 }
             }
-            let selection = select(request)?;
-
-            if json {
-                println!("{}", serde_json::to_string_pretty(&selection)?);
+            let selection = if interactive {
+                if !io::stdin().is_terminal() {
+                    return Err(io::Error::other(
+                        "interactive selection requires a terminal; use --all or --select PATH for non-interactive use",
+                    )
+                    .into());
+                }
+                select_interactively(request, prompt_for_selection)?
             } else {
-                print_selection_human(&selection);
+                Some(select(request)?)
+            };
+
+            if let Some(selection) = selection {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&selection)?);
+                } else {
+                    print_selection_human(&selection);
+                }
+            } else {
+                println!("Skill Selection unchanged.");
             }
         }
     }
 
     Ok(())
+}
+
+fn prompt_for_selection(
+    prompt: &InteractiveSelectionPrompt,
+) -> Result<Option<Vec<String>>, dialoguer::Error> {
+    if !prompt.missing_paths.is_empty() {
+        eprintln!("Previously selected Skills missing from the resolved revision:");
+        for path in &prompt.missing_paths {
+            eprintln!("- {path} (missing)");
+        }
+        eprintln!("These paths will be removed only if you confirm the replacement.");
+    }
+
+    let labels = prompt
+        .options
+        .iter()
+        .map(|option| option.terminal_label())
+        .collect::<Vec<_>>();
+    let defaults = prompt
+        .options
+        .iter()
+        .map(|option| option.preselected)
+        .collect::<Vec<_>>();
+    let selected_paths = if labels.is_empty() {
+        Vec::new()
+    } else {
+        MultiSelect::new()
+            .with_prompt("Select Skills")
+            .items(&labels)
+            .defaults(&defaults)
+            .interact()?
+            .into_iter()
+            .map(|index| prompt.options[index].path.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let overlaps = prompt.overlaps(&selected_paths);
+    if !overlaps.is_empty() {
+        eprintln!("warning: overlapping parent and Nested Skills are selected:");
+        for overlap in overlaps {
+            eprintln!("- {} contains {}", overlap.parent_path, overlap.nested_path);
+        }
+        eprintln!("Selecting both is allowed, but their contents may overlap.");
+    }
+
+    let confirmation = if selected_paths.is_empty() {
+        "Confirm the empty selection and remove this Source Repository?"
+    } else {
+        "Replace this Source Repository's Skill Selection?"
+    };
+    Ok(Confirm::new()
+        .with_prompt(confirmation)
+        .default(false)
+        .interact()?
+        .then_some(selected_paths))
 }
 
 fn print_discovery_human(discovery: &Discovery) {
