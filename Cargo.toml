@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "Discover coding-agent skills in source repositories"
+description = "Discover and select coding-agent skills from source repositories"
 repository = "https://github.com/devndive/skill-manager"
 
 [dependencies]
@@ -14,6 +14,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.20"
 thiserror = "2.0"
+toml_edit = "0.22"
+pathdiff = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

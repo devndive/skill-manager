@@ -1,4 +1,6 @@
-use std::io::{self, Read};
+use std::collections::BTreeSet;
+use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,8 +8,9 @@ use std::thread;
 use std::time::Duration;
 
 use serde::Serialize;
-use tempfile::TempDir;
+use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
+use toml_edit::{Array, ArrayOfTables, DocumentMut, Formatted, Item, Table, Value, value};
 
 static CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -71,7 +74,7 @@ impl DiscoverRequest {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Discovery {
     pub schema_version: u32,
     pub source: SourceRepository,
@@ -80,14 +83,14 @@ pub struct Discovery {
     pub skills: Vec<Skill>,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SourceRepository {
     #[serde(rename = "type")]
     pub repository_type: &'static str,
     pub path: String,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Skill {
     pub identity: SkillIdentity,
     pub name: String,
@@ -95,7 +98,7 @@ pub struct Skill {
     pub parent_path: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SkillIdentity {
     pub source: String,
     pub path: String,
@@ -153,6 +156,108 @@ pub enum DiscoverError {
     Cancelled,
 }
 
+#[derive(Debug, Clone)]
+pub struct SelectRequest {
+    discovery: DiscoverRequest,
+    manifest_path: PathBuf,
+    selection: RequestedSkillSelection,
+}
+
+#[derive(Debug, Clone)]
+enum RequestedSkillSelection {
+    Paths(Vec<String>),
+    All,
+}
+
+impl SelectRequest {
+    pub fn new(source: impl Into<DiscoverSource>) -> Self {
+        Self {
+            discovery: DiscoverRequest::new(source),
+            manifest_path: PathBuf::from("skills.toml"),
+            selection: RequestedSkillSelection::Paths(Vec::new()),
+        }
+    }
+
+    pub fn with_revision(mut self, revision: impl Into<String>) -> Self {
+        self.discovery = self.discovery.with_revision(revision);
+        self
+    }
+
+    pub fn with_manifest_path(mut self, manifest_path: impl Into<PathBuf>) -> Self {
+        self.manifest_path = manifest_path.into();
+        self
+    }
+
+    pub fn select_all(mut self) -> Self {
+        self.selection = RequestedSkillSelection::All;
+        self
+    }
+
+    pub fn select_path(mut self, path: impl Into<String>) -> Self {
+        let path = path.into();
+        match &mut self.selection {
+            RequestedSkillSelection::Paths(paths) => paths.push(path),
+            RequestedSkillSelection::All => {
+                self.selection = RequestedSkillSelection::Paths(vec![path]);
+            }
+        }
+        self
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct SkillSelection {
+    pub schema_version: u32,
+    pub manifest_path: String,
+    pub source: SourceRepository,
+    pub requested_revision: String,
+    pub resolved_commit: String,
+    pub skills: Vec<Skill>,
+}
+
+#[derive(Debug, Error)]
+pub enum SelectError {
+    #[error(transparent)]
+    Discovery(#[from] DiscoverError),
+    #[error(
+        "Skill Selection contains paths not present in Source Repository '{repository}': {paths:?}"
+    )]
+    InvalidSelection {
+        repository: String,
+        paths: Vec<String>,
+    },
+    #[error("could not read Skill Selection manifest '{path}': {source}")]
+    ManifestRead {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not parse Skill Selection manifest '{path}': {source}")]
+    ManifestParse {
+        path: String,
+        #[source]
+        source: toml_edit::TomlError,
+    },
+    #[error("Skill Selection manifest '{path}' is invalid: {details}")]
+    InvalidManifest { path: String, details: String },
+    #[error(
+        "Skill Selection manifest '{path}' uses unsupported manifest version {version}; expected 1"
+    )]
+    UnsupportedManifestVersion { path: String, version: i64 },
+    #[error("could not resolve Skill Selection manifest directory '{path}': {source}")]
+    ManifestDirectory {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not write Skill Selection manifest '{path}': {source}")]
+    ManifestWrite {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+}
+
 pub fn install_cancellation_handler() -> Result<(), ctrlc::Error> {
     CANCELLATION_REQUESTED.store(false, Ordering::SeqCst);
     ctrlc::set_handler(|| {
@@ -161,19 +266,363 @@ pub fn install_cancellation_handler() -> Result<(), ctrlc::Error> {
 }
 
 pub fn discover(request: DiscoverRequest) -> Result<Discovery, DiscoverError> {
+    discover_with_options(request, false)
+}
+
+fn discover_with_options(
+    request: DiscoverRequest,
+    allow_empty: bool,
+) -> Result<Discovery, DiscoverError> {
     if cancellation_requested() {
         return Err(DiscoverError::Cancelled);
     }
     let requested_revision = request.revision.as_deref().unwrap_or("HEAD").to_owned();
     match request.source {
-        DiscoverSource::Local(source) => discover_local(source, requested_revision),
-        DiscoverSource::PublicGitHubUrl(source) => discover_github(source, requested_revision),
+        DiscoverSource::Local(source) => discover_local(source, requested_revision, allow_empty),
+        DiscoverSource::PublicGitHubUrl(source) => {
+            discover_github(source, requested_revision, allow_empty)
+        }
+    }
+}
+
+pub fn select(request: SelectRequest) -> Result<SkillSelection, SelectError> {
+    let allow_empty = matches!(&request.selection, RequestedSkillSelection::Paths(_));
+    let discovery = discover_with_options(request.discovery, allow_empty)?;
+    ensure_selection_not_cancelled()?;
+    let skills = match request.selection {
+        RequestedSkillSelection::All => discovery.skills.clone(),
+        RequestedSkillSelection::Paths(paths) => {
+            let paths = paths.into_iter().collect::<BTreeSet<_>>();
+            let discovered_paths = discovery
+                .skills
+                .iter()
+                .map(|skill| skill.path.as_str())
+                .collect::<BTreeSet<_>>();
+            let missing = paths
+                .iter()
+                .filter(|path| !discovered_paths.contains(path.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(SelectError::InvalidSelection {
+                    repository: discovery.source.path.clone(),
+                    paths: missing,
+                });
+            }
+            discovery
+                .skills
+                .iter()
+                .filter(|skill| paths.contains(&skill.path))
+                .cloned()
+                .collect()
+        }
+    };
+    let manifest_parent = request
+        .manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent =
+        fs::canonicalize(manifest_parent).map_err(|source| SelectError::ManifestDirectory {
+            path: display_path(manifest_parent),
+            source,
+        })?;
+
+    ensure_selection_not_cancelled()?;
+    let manifest_display = display_path(&request.manifest_path);
+    let mut document = match fs::read_to_string(&request.manifest_path) {
+        Ok(contents) => {
+            contents
+                .parse::<DocumentMut>()
+                .map_err(|source| SelectError::ManifestParse {
+                    path: manifest_display.clone(),
+                    source,
+                })?
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut document = DocumentMut::new();
+            document["manifest_version"] = value(1);
+            document["sources"] = Item::ArrayOfTables(ArrayOfTables::new());
+            document
+        }
+        Err(source) => {
+            return Err(SelectError::ManifestRead {
+                path: manifest_display,
+                source,
+            });
+        }
+    };
+    match document.get("manifest_version").and_then(Item::as_integer) {
+        Some(1) => {}
+        Some(version) => {
+            return Err(SelectError::UnsupportedManifestVersion {
+                path: display_path(&request.manifest_path),
+                version,
+            });
+        }
+        None => {
+            return Err(SelectError::InvalidManifest {
+                path: display_path(&request.manifest_path),
+                details: "missing integer 'manifest_version'".to_owned(),
+            });
+        }
+    }
+    if document.get("sources").is_none() {
+        document["sources"] = Item::ArrayOfTables(ArrayOfTables::new());
+    }
+    let manifest_path = display_path(&request.manifest_path);
+    let sources = document["sources"]
+        .as_array_of_tables_mut()
+        .ok_or_else(|| SelectError::InvalidManifest {
+            path: manifest_path.clone(),
+            details: "'sources' must be an array of tables".to_owned(),
+        })?;
+    validate_sources(sources, &manifest_path)?;
+    let matching_source_indices = sources
+        .iter()
+        .enumerate()
+        .filter_map(|(index, source)| {
+            source_matches(source, &discovery.source, &canonical_parent).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if skills.is_empty() {
+        for index in matching_source_indices.into_iter().rev() {
+            sources.remove(index);
+        }
+    } else if let Some(&index) = matching_source_indices.first() {
+        update_source_table(
+            sources
+                .get_mut(index)
+                .expect("source index came from iterator"),
+            &discovery,
+            &skills,
+            &canonical_parent,
+        );
+        for index in matching_source_indices.into_iter().skip(1).rev() {
+            sources.remove(index);
+        }
+    } else {
+        let mut source = Table::new();
+        update_source_table(&mut source, &discovery, &skills, &canonical_parent);
+        sources.push(source);
+    }
+
+    ensure_selection_not_cancelled()?;
+    write_manifest_atomic(&request.manifest_path, document.to_string().as_bytes())?;
+
+    Ok(SkillSelection {
+        schema_version: 1,
+        manifest_path: display_path(&request.manifest_path),
+        source: discovery.source,
+        requested_revision: discovery.requested_revision,
+        resolved_commit: discovery.resolved_commit,
+        skills,
+    })
+}
+
+fn manifest_source_path(source: &SourceRepository, manifest_parent: &Path) -> String {
+    if source.repository_type != "local" {
+        return source.path.clone();
+    }
+
+    let source_path = Path::new(&source.path);
+    pathdiff::diff_paths(source_path, manifest_parent)
+        .unwrap_or_else(|| source_path.to_owned())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn source_matches(table: &Table, source: &SourceRepository, manifest_parent: &Path) -> bool {
+    if table.get("type").and_then(Item::as_str) != Some(source.repository_type) {
+        return false;
+    }
+    let Some(stored_path) = table.get("path").and_then(Item::as_str) else {
+        return false;
+    };
+    if source.repository_type != "local" {
+        return stored_path == source.path;
+    }
+
+    let stored_path = Path::new(stored_path);
+    let stored_path = if stored_path.is_absolute() {
+        stored_path.to_owned()
+    } else {
+        manifest_parent.join(stored_path)
+    };
+    fs::canonicalize(stored_path).is_ok_and(|path| path == Path::new(&source.path))
+}
+
+fn validate_sources(sources: &ArrayOfTables, manifest_path: &str) -> Result<(), SelectError> {
+    for (index, source) in sources.iter().enumerate() {
+        for field in ["type", "path", "requested_revision", "resolved_commit"] {
+            if source.get(field).and_then(Item::as_str).is_none() {
+                return Err(SelectError::InvalidManifest {
+                    path: manifest_path.to_owned(),
+                    details: format!(
+                        "Source Repository entry {} is missing string '{field}'",
+                        index + 1
+                    ),
+                });
+            }
+        }
+        let repository_type = source["type"]
+            .as_str()
+            .expect("source type was validated as a string");
+        if !matches!(repository_type, "local" | "github") {
+            return Err(SelectError::InvalidManifest {
+                path: manifest_path.to_owned(),
+                details: format!(
+                    "Source Repository entry {} has unsupported type '{repository_type}'",
+                    index + 1
+                ),
+            });
+        }
+        let Some(skills) = source.get("skills").and_then(Item::as_array) else {
+            return Err(SelectError::InvalidManifest {
+                path: manifest_path.to_owned(),
+                details: format!(
+                    "Source Repository entry {} is missing array 'skills'",
+                    index + 1
+                ),
+            });
+        };
+        if skills.iter().any(|skill| skill.as_str().is_none()) {
+            return Err(SelectError::InvalidManifest {
+                path: manifest_path.to_owned(),
+                details: format!(
+                    "Source Repository entry {} contains a non-string Skill path",
+                    index + 1
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn update_source_table(
+    table: &mut Table,
+    discovery: &Discovery,
+    skills: &[Skill],
+    manifest_parent: &Path,
+) {
+    let selected_paths = updated_skill_paths(table, skills);
+    set_table_value(table, "type", Value::from(discovery.source.repository_type));
+    set_table_value(
+        table,
+        "path",
+        Value::from(manifest_source_path(&discovery.source, manifest_parent)),
+    );
+    set_table_value(
+        table,
+        "requested_revision",
+        Value::from(&discovery.requested_revision),
+    );
+    set_table_value(
+        table,
+        "resolved_commit",
+        Value::from(&discovery.resolved_commit),
+    );
+    set_table_value(table, "skills", Value::Array(selected_paths));
+}
+
+fn updated_skill_paths(table: &Table, skills: &[Skill]) -> Array {
+    let requested_paths = skills
+        .iter()
+        .map(|skill| skill.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut selected_paths = table
+        .get("skills")
+        .and_then(Item::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let multiline_indentation = selected_paths
+        .iter()
+        .filter_map(|value| value.decor().prefix().and_then(|prefix| prefix.as_str()))
+        .find(|prefix| prefix.contains('\n'))
+        .map(multiline_indentation);
+    let mut retained_paths = BTreeSet::new();
+    let mut removed_indices = Vec::new();
+    for index in 0..selected_paths.len() {
+        let retained = selected_paths
+            .get(index)
+            .and_then(Value::as_str)
+            .is_some_and(|path| {
+                requested_paths.contains(path) && retained_paths.insert(path.to_owned())
+            });
+        if !retained {
+            removed_indices.push(index);
+        }
+    }
+    for index in removed_indices.into_iter().rev() {
+        selected_paths.remove(index);
+    }
+    for skill in skills {
+        if retained_paths.insert(skill.path.clone()) {
+            if let Some(indentation) = &multiline_indentation {
+                let mut path = Formatted::new(skill.path.clone());
+                path.decor_mut().set_prefix(indentation);
+                selected_paths.push_formatted(Value::String(path));
+            } else {
+                selected_paths.push(skill.path.as_str());
+            }
+        }
+    }
+    selected_paths
+}
+
+fn multiline_indentation(prefix: &str) -> String {
+    let indentation = prefix.rsplit_once('\n').map_or("", |(_, suffix)| suffix);
+    format!("\n{indentation}")
+}
+
+fn set_table_value(table: &mut Table, key: &str, mut new_value: Value) {
+    if let Some(existing_value) = table.get(key).and_then(Item::as_value) {
+        new_value.decor_mut().clone_from(existing_value.decor());
+    }
+    table[key] = Item::Value(new_value);
+}
+
+fn write_manifest_atomic(manifest_path: &Path, contents: &[u8]) -> Result<(), SelectError> {
+    ensure_selection_not_cancelled()?;
+    let parent = manifest_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let manifest = display_path(manifest_path);
+    let mut temporary =
+        NamedTempFile::new_in(parent).map_err(|source| SelectError::ManifestWrite {
+            path: manifest.clone(),
+            source,
+        })?;
+    temporary
+        .write_all(contents)
+        .and_then(|()| temporary.as_file_mut().sync_all())
+        .map_err(|source| SelectError::ManifestWrite {
+            path: manifest.clone(),
+            source,
+        })?;
+    ensure_selection_not_cancelled()?;
+    temporary
+        .persist(manifest_path)
+        .map_err(|error| SelectError::ManifestWrite {
+            path: manifest,
+            source: error.error,
+        })?;
+    Ok(())
+}
+
+fn ensure_selection_not_cancelled() -> Result<(), SelectError> {
+    if cancellation_requested() {
+        Err(DiscoverError::Cancelled.into())
+    } else {
+        Ok(())
     }
 }
 
 fn discover_local(
     source_path: PathBuf,
     requested_revision: String,
+    allow_empty: bool,
 ) -> Result<Discovery, DiscoverError> {
     let source = display_path(&source_path);
     let repository_root =
@@ -209,12 +658,13 @@ fn discover_local(
         name: repository_name,
         resolve_remote_branch: false,
     };
-    discover_repository(&repository_root, context, requested_revision)
+    discover_repository(&repository_root, context, requested_revision, allow_empty)
 }
 
 fn discover_github(
     source_url: String,
     requested_revision: String,
+    allow_empty: bool,
 ) -> Result<Discovery, DiscoverError> {
     let github = normalize_github_url(&source_url)?;
     let temporary = TempDir::new().map_err(|source| DiscoverError::TemporaryRepository {
@@ -251,7 +701,7 @@ fn discover_github(
                 name: github.repository_name,
                 resolve_remote_branch: true,
             };
-            discover_repository(&repository_root, context, requested_revision)
+            discover_repository(&repository_root, context, requested_revision, allow_empty)
         })
         .and_then(|discovery| {
             if cancellation_requested() {
@@ -280,6 +730,7 @@ fn discover_repository(
     repository_root: &Path,
     context: RepositoryContext,
     requested_revision: String,
+    allow_empty: bool,
 ) -> Result<Discovery, DiscoverError> {
     let resolved_commit = resolve_commit(
         repository_root,
@@ -358,7 +809,7 @@ fn discover_repository(
     }
     skill_paths.sort();
 
-    if skill_paths.is_empty() {
+    if skill_paths.is_empty() && !allow_empty {
         return Err(DiscoverError::NoSkills(context.identity));
     }
 

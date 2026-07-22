@@ -1,7 +1,11 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use skill_manager::{DiscoverRequest, Discovery, discover, install_cancellation_handler};
+use skill_manager::{
+    DiscoverRequest, Discovery, SelectRequest, SkillSelection, discover,
+    install_cancellation_handler, select,
+};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -19,6 +23,26 @@ enum Commands {
         /// Branch, tag, or commit to inspect instead of HEAD.
         #[arg(long = "ref", value_name = "REVISION", allow_hyphen_values = true)]
         reference: Option<String>,
+        /// Emit the versioned JSON schema.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Persist a Skill Selection without installing files.
+    Select {
+        /// Local path or public GitHub URL for the Source Repository.
+        source: String,
+        /// Branch, tag, or commit to inspect instead of HEAD.
+        #[arg(long = "ref", value_name = "REVISION", allow_hyphen_values = true)]
+        reference: Option<String>,
+        /// Select every discovered Skill.
+        #[arg(long, conflicts_with = "selected_paths")]
+        all: bool,
+        /// Select a discovered Skill by exact repository-relative path.
+        #[arg(long = "select", value_name = "PATH")]
+        selected_paths: Vec<String>,
+        /// Skill Selection manifest to update.
+        #[arg(long, value_name = "FILE", default_value = "skills.toml")]
+        manifest: PathBuf,
         /// Emit the versioned JSON schema.
         #[arg(long)]
         json: bool,
@@ -56,7 +80,34 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&discovery)?);
             } else {
-                print_human(&discovery);
+                print_discovery_human(&discovery);
+            }
+        }
+        Commands::Select {
+            source,
+            reference,
+            all,
+            selected_paths,
+            manifest,
+            json,
+        } => {
+            let mut request = SelectRequest::new(source).with_manifest_path(manifest);
+            if let Some(reference) = reference {
+                request = request.with_revision(reference);
+            }
+            if all {
+                request = request.select_all();
+            } else {
+                for path in selected_paths {
+                    request = request.select_path(path);
+                }
+            }
+            let selection = select(request)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&selection)?);
+            } else {
+                print_selection_human(&selection);
             }
         }
     }
@@ -64,7 +115,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn print_human(discovery: &Discovery) {
+fn print_discovery_human(discovery: &Discovery) {
     println!("Source Repository: {}", discovery.source.path);
     println!("Requested revision: {}", discovery.requested_revision);
     println!("Resolved commit: {}", discovery.resolved_commit);
@@ -75,5 +126,21 @@ fn print_human(discovery: &Discovery) {
         } else {
             println!("- {} ({})", skill.name, skill.path);
         }
+    }
+}
+
+fn print_selection_human(skill_selection: &SkillSelection) {
+    println!("Manifest: {}", skill_selection.manifest_path);
+    println!("Source Repository: {}", skill_selection.source.path);
+    println!("Requested revision: {}", skill_selection.requested_revision);
+    println!("Resolved commit: {}", skill_selection.resolved_commit);
+    if skill_selection.skills.is_empty() {
+        println!("Skill Selection: none");
+        return;
+    }
+
+    println!("Skill Selection:");
+    for skill in &skill_selection.skills {
+        println!("- {} ({})", skill.name, skill.path);
     }
 }

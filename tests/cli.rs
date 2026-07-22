@@ -285,3 +285,164 @@ fn cli_cleans_the_temporary_clone_when_remote_discovery_is_cancelled() {
         assert!(!clone_path.exists());
     }
 }
+
+#[test]
+fn cli_selects_all_skills_into_the_default_manifest() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha\n");
+    repository.write("beta/SKILL.md", "# Beta\n");
+    let commit = repository.commit("add skills");
+    let working_directory = TempDir::new().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
+        .args(["select", repository.path().to_str().unwrap(), "--all"])
+        .current_dir(working_directory.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), "");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "Manifest: skills.toml\nSource Repository: {}\nRequested revision: HEAD\nResolved commit: {commit}\nSkill Selection:\n- alpha (alpha)\n- beta (beta)\n",
+            fs::canonicalize(repository.path()).unwrap().display()
+        )
+    );
+    assert!(working_directory.path().join("skills.toml").is_file());
+}
+
+#[test]
+fn cli_selects_repeated_exact_paths_into_a_custom_manifest_as_json() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/child/SKILL.md", "# First\n");
+    repository.write("beta/child/SKILL.md", "# Second\n");
+    let commit = repository.commit("add duplicate names");
+    repository.git(&["tag", "v1"]);
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("selected.toml");
+    let source = fs::canonicalize(repository.path())
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
+        .args([
+            "select",
+            repository.path().to_str().unwrap(),
+            "--ref",
+            "v1",
+            "--select",
+            "beta/child",
+            "--select",
+            "alpha/child",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), "");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        json!({
+            "schema_version": 1,
+            "manifest_path": manifest_path.to_str().unwrap(),
+            "source": {
+                "type": "local",
+                "path": source,
+            },
+            "requested_revision": "v1",
+            "resolved_commit": commit,
+            "skills": [{
+                "identity": {
+                    "source": source,
+                    "path": "alpha/child",
+                },
+                "name": "child",
+                "path": "alpha/child",
+                "parent_path": null,
+            }, {
+                "identity": {
+                    "source": source,
+                    "path": "beta/child",
+                },
+                "name": "child",
+                "path": "beta/child",
+                "parent_path": null,
+            }],
+        })
+    );
+    assert!(manifest_path.is_file());
+}
+
+#[test]
+fn cli_invalid_selection_writes_only_a_diagnostic_and_keeps_the_manifest() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("kept/SKILL.md", "# Kept\n");
+    repository.commit("add skill");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    let original = "# existing manifest\nmanifest_version = 1\nsources = []\n";
+    fs::write(&manifest_path, original).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
+        .args([
+            "select",
+            repository.path().to_str().unwrap(),
+            "--select",
+            "missing",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("Skill Selection contains paths not present")
+    );
+    assert_eq!(fs::read_to_string(manifest_path).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_cancelled_selection_does_not_create_a_manifest() {
+    let lock = git_environment_lock();
+    let fake_github = common::FakeGitHub::signal_clone("INT", lock);
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
+        .args([
+            "select",
+            "https://github.com/devndive/skill-manager",
+            "--all",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("discovery was cancelled")
+    );
+    assert!(!manifest_path.exists());
+    let clone_path = PathBuf::from(fake_github.commands()[0].last().unwrap());
+    assert!(!clone_path.exists());
+}
