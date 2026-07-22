@@ -17,7 +17,7 @@ pub struct DiscoverRequest {
 #[derive(Debug, Clone)]
 pub enum DiscoverSource {
     Local(PathBuf),
-    Url(String),
+    PublicGitHubUrl(String),
 }
 
 impl From<PathBuf> for DiscoverSource {
@@ -40,8 +40,8 @@ impl From<&PathBuf> for DiscoverSource {
 
 impl From<String> for DiscoverSource {
     fn from(source: String) -> Self {
-        if source.contains("://") || source.starts_with("git@") {
-            Self::Url(source)
+        if looks_like_repository_url(&source) {
+            Self::PublicGitHubUrl(source)
         } else {
             Self::Local(source.into())
         }
@@ -138,6 +138,14 @@ pub enum DiscoverError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "{discovery}; additionally, temporary repository data for Source Repository '{repository}' could not be removed: {cleanup}"
+    )]
+    CleanupAfterFailure {
+        repository: String,
+        discovery: Box<DiscoverError>,
+        cleanup: std::io::Error,
+    },
     #[error("discovery was cancelled")]
     Cancelled,
 }
@@ -156,7 +164,7 @@ pub fn discover(request: DiscoverRequest) -> Result<Discovery, DiscoverError> {
     let requested_revision = request.revision.as_deref().unwrap_or("HEAD").to_owned();
     match request.source {
         DiscoverSource::Local(source) => discover_local(source, requested_revision),
-        DiscoverSource::Url(source) => discover_github(source, requested_revision),
+        DiscoverSource::PublicGitHubUrl(source) => discover_github(source, requested_revision),
     }
 }
 
@@ -192,14 +200,13 @@ fn discover_local(
         })?
         .to_owned();
 
-    discover_repository(
-        &repository_root,
-        "local",
-        repository_path,
-        repository_name,
-        requested_revision,
-        false,
-    )
+    let context = RepositoryContext {
+        repository_type: "local",
+        identity: repository_path,
+        name: repository_name,
+        resolve_remote_branch: false,
+    };
+    discover_repository(&repository_root, context, requested_revision)
 }
 
 fn discover_github(
@@ -231,14 +238,13 @@ fn discover_github(
             }
         })
         .and_then(|()| {
-            discover_repository(
-                &repository_root,
-                "github",
-                github.identity.clone(),
-                github.repository_name,
-                requested_revision,
-                true,
-            )
+            let context = RepositoryContext {
+                repository_type: "github",
+                identity: github.identity.clone(),
+                name: github.repository_name,
+                resolve_remote_branch: true,
+            };
+            discover_repository(&repository_root, context, requested_revision)
         })
         .and_then(|discovery| {
             if cancellation_requested() {
@@ -250,7 +256,12 @@ fn discover_github(
     let cleanup = temporary.close();
     match (result, cleanup) {
         (Ok(discovery), Ok(())) => Ok(discovery),
-        (Err(error), _) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(discovery), Err(cleanup)) => Err(DiscoverError::CleanupAfterFailure {
+            repository: github.identity,
+            discovery: Box::new(discovery),
+            cleanup,
+        }),
         (Ok(_), Err(source)) => Err(DiscoverError::TemporaryCleanup {
             repository: github.identity,
             source,
@@ -260,27 +271,26 @@ fn discover_github(
 
 fn discover_repository(
     repository_root: &Path,
-    repository_type: &'static str,
-    source: String,
-    repository_name: String,
+    context: RepositoryContext,
     requested_revision: String,
-    resolve_remote_branch: bool,
 ) -> Result<Discovery, DiscoverError> {
-    let resolved_commit =
-        resolve_commit(repository_root, &requested_revision, resolve_remote_branch).map_err(
-            |error| match error {
-                GitFailure::Unavailable(error) => DiscoverError::GitUnavailable(error),
-                GitFailure::Failed(details) => DiscoverError::RevisionUnavailable {
-                    repository: source.clone(),
-                    revision: requested_revision.clone(),
-                    details,
-                },
-                GitFailure::InvalidUtf8 => DiscoverError::InvalidGitOutput {
-                    operation: "resolving the requested revision",
-                },
-                GitFailure::Cancelled => DiscoverError::Cancelled,
-            },
-        )?;
+    let resolved_commit = resolve_commit(
+        repository_root,
+        &requested_revision,
+        context.resolve_remote_branch,
+    )
+    .map_err(|error| match error {
+        GitFailure::Unavailable(error) => DiscoverError::GitUnavailable(error),
+        GitFailure::Failed(details) => DiscoverError::RevisionUnavailable {
+            repository: context.identity.clone(),
+            revision: requested_revision.clone(),
+            details,
+        },
+        GitFailure::InvalidUtf8 => DiscoverError::InvalidGitOutput {
+            operation: "resolving the requested revision",
+        },
+        GitFailure::Cancelled => DiscoverError::Cancelled,
+    })?;
 
     let tree = git_bytes(
         repository_root,
@@ -295,7 +305,7 @@ fn discover_repository(
     .map_err(|error| match error {
         GitFailure::Unavailable(error) => DiscoverError::GitUnavailable(error),
         GitFailure::Failed(details) => DiscoverError::RevisionUnavailable {
-            repository: source.clone(),
+            repository: context.identity.clone(),
             revision: requested_revision.clone(),
             details,
         },
@@ -335,7 +345,7 @@ fn discover_repository(
             let directory = &path[..path.len() - b"/SKILL.md".len()];
             Some(
                 std::str::from_utf8(directory)
-                    .map_err(|_| DiscoverError::InvalidSkillPath(source.clone()))?
+                    .map_err(|_| DiscoverError::InvalidSkillPath(context.identity.clone()))?
                     .to_owned(),
             )
         } else {
@@ -348,7 +358,7 @@ fn discover_repository(
     skill_paths.sort();
 
     if skill_paths.is_empty() {
-        return Err(DiscoverError::NoSkills(source));
+        return Err(DiscoverError::NoSkills(context.identity));
     }
 
     let skills = skill_paths
@@ -361,14 +371,14 @@ fn discover_repository(
                 .max_by_key(|candidate| candidate.len())
                 .cloned();
             let name = if path == "." {
-                repository_name.clone()
+                context.name.clone()
             } else {
                 path.rsplit('/').next().unwrap_or(path).to_owned()
             };
 
             Skill {
                 identity: SkillIdentity {
-                    source: source.clone(),
+                    source: context.identity.clone(),
                     path: path.clone(),
                 },
                 name,
@@ -381,13 +391,20 @@ fn discover_repository(
     Ok(Discovery {
         schema_version: 1,
         source: SourceRepository {
-            repository_type,
-            path: source,
+            repository_type: context.repository_type,
+            path: context.identity,
         },
         requested_revision,
         resolved_commit,
         skills,
     })
+}
+
+struct RepositoryContext {
+    repository_type: &'static str,
+    identity: String,
+    name: String,
+    resolve_remote_branch: bool,
 }
 
 fn resolve_commit(
@@ -500,6 +517,16 @@ fn invalid_source_url(source: &str, details: &str) -> DiscoverError {
         url: source.to_owned(),
         details: details.to_owned(),
     }
+}
+
+fn looks_like_repository_url(source: &str) -> bool {
+    source.contains("://")
+        || source.starts_with("git@")
+        || ["http:", "https:", "ssh:", "git:"].iter().any(|scheme| {
+            source
+                .get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        })
 }
 
 enum GitFailure {

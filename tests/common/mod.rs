@@ -77,21 +77,21 @@ pub struct FakeGitHub {
 #[allow(dead_code)]
 impl FakeGitHub {
     pub fn new(repository: &Path, lock: MutexGuard<'static, ()>) -> Self {
-        Self::with_clone_behavior(Some(repository), None, false, lock)
+        Self::with_clone_behavior(Some(repository), None, None, lock)
     }
 
     pub fn failing_clone(message: &str, lock: MutexGuard<'static, ()>) -> Self {
-        Self::with_clone_behavior(None, Some(message), false, lock)
+        Self::with_clone_behavior(None, Some(message), None, lock)
     }
 
-    pub fn cancelling_clone(lock: MutexGuard<'static, ()>) -> Self {
-        Self::with_clone_behavior(None, None, true, lock)
+    pub fn signal_clone(signal: &str, lock: MutexGuard<'static, ()>) -> Self {
+        Self::with_clone_behavior(None, None, Some(signal), lock)
     }
 
     fn with_clone_behavior(
         repository: Option<&Path>,
         clone_error: Option<&str>,
-        cancel: bool,
+        signal: Option<&str>,
         lock: MutexGuard<'static, ()>,
     ) -> Self {
         use std::os::unix::fs::PermissionsExt;
@@ -122,8 +122,8 @@ if [ "$1" = "clone" ]; then
     printf '%s\n' "$SKILL_MANAGER_TEST_CLONE_ERROR" >&2
     exit 128
   fi
-  if [ "$SKILL_MANAGER_TEST_CANCEL" = "1" ]; then
-    kill -INT "$PPID"
+  if [ -n "$SKILL_MANAGER_TEST_SIGNAL" ]; then
+    kill -"$SKILL_MANAGER_TEST_SIGNAL" "$PPID"
     sleep 0.1
     exit 130
   fi
@@ -154,7 +154,7 @@ exec "$SKILL_MANAGER_TEST_REAL_GIT" "$@"
                 "SKILL_MANAGER_TEST_CLONE_ERROR",
                 clone_error.unwrap_or_default(),
             ),
-            EnvironmentVariable::set("SKILL_MANAGER_TEST_CANCEL", if cancel { "1" } else { "0" }),
+            EnvironmentVariable::set("SKILL_MANAGER_TEST_SIGNAL", signal.unwrap_or_default()),
         ];
 
         Self {

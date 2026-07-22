@@ -258,25 +258,27 @@ fn cli_remote_revision_failures_never_print_success_output() {
 #[cfg(unix)]
 #[test]
 fn cli_cleans_the_temporary_clone_when_remote_discovery_is_cancelled() {
-    let lock = git_environment_lock();
-    let fake_github = common::FakeGitHub::cancelling_clone(lock);
+    for signal in ["INT", "TERM"] {
+        let lock = git_environment_lock();
+        let fake_github = common::FakeGitHub::signal_clone(signal, lock);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
-        .args([
-            "discover",
-            "https://github.com/devndive/skill-manager",
-            "--json",
-        ])
-        .output()
-        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
+            .args([
+                "discover",
+                "https://github.com/devndive/skill-manager",
+                "--json",
+            ])
+            .output()
+            .unwrap();
 
-    assert!(!output.status.success());
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("discovery was cancelled")
-    );
-    let clone_path = PathBuf::from(fake_github.commands()[0].last().unwrap());
-    assert!(!clone_path.exists());
+        assert!(!output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("discovery was cancelled")
+        );
+        let clone_path = PathBuf::from(fake_github.commands()[0].last().unwrap());
+        assert!(!clone_path.exists());
+    }
 }

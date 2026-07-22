@@ -347,6 +347,7 @@ fn library_rejects_unsupported_and_malformed_source_repository_urls() {
     for source in [
         "https://gitlab.com/devndive/skill-manager",
         "https://github.com/devndive",
+        "https:/github.com/devndive/skill-manager",
         "git@github.com:devndive/skill-manager.git",
     ] {
         let error = discover(DiscoverRequest::new(source)).unwrap_err();
