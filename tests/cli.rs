@@ -1,6 +1,8 @@
 use std::fs;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use serde_json::json;

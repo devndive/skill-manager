@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(unix)]
 use std::path::PathBuf;
 
 use skill_manager::{DiscoverError, DiscoverRequest, discover};
