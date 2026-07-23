@@ -23,3 +23,19 @@ _Avoid_: Sub-skill
 **Skill Selection**:
 The persisted subset of discovered Skills chosen by the user for subsequent use. Selection does not mean installation.
 _Avoid_: Installed skills
+
+**Skill Synchronization**:
+Reconciliation of materialized Skills with a Skill Selection. The first synchronization materializes selected Skills; later synchronizations update or remove them to match the selection.
+_Avoid_: Installation workflow
+
+**Materialized Skill**:
+A copy of a selected Skill in a Synchronization Destination that is managed by Skill Manager.
+_Avoid_: Skill Selection, installed selection
+
+**Materialized Skill Drift**:
+A difference between a Materialized Skill's current contents and the contents recorded by its last successful Skill Synchronization.
+_Avoid_: Source update
+
+**Synchronization Destination**:
+The directory whose materialized Skills are reconciled during Skill Synchronization.
+_Avoid_: Installation location
