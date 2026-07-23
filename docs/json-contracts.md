@@ -1,8 +1,8 @@
 # Versioned JSON contracts
 
-`discover --json`, `select --json`, and `list --json` each write one JSON
-document to standard output. Diagnostics are written to standard error.
-Failures return a non-zero status and write no JSON to standard output.
+`discover --json`, `select --json`, `list --json`, and `sync --json` each write
+one JSON document to standard output. Diagnostics are written to standard
+error. Failures return a non-zero status and write no JSON to standard output.
 
 All current contracts use `"schema_version": 1`.
 
@@ -176,3 +176,38 @@ This example shows multiple sources:
 ```
 
 `remove` has no JSON mode.
+
+## `sync --json`
+
+The top-level object contains:
+
+- `manifest_path`: the supplied manifest path, or `skills.toml`.
+- `destination`: the explicit target or the manifest-relative
+  `.agents/skills` default.
+- `created`: newly Materialized Skills ordered by destination name.
+
+Each created Skill contains its Skill Identity, destination `name`, recorded
+`resolved_commit`, and deterministic `sha256:` content digest:
+
+```json
+{
+  "schema_version": 1,
+  "manifest_path": "config/skills.toml",
+  "destination": "config/.agents/skills",
+  "created": [
+    {
+      "identity": {
+        "source": "/work/agent-skills",
+        "path": "review"
+      },
+      "name": "review",
+      "resolved_commit": "89abcdef0123456789abcdef0123456789abcdef",
+      "digest": "sha256:17f1f9b14f0f13e734a5d7781a9f6a7b732c3e61c1f4e10a506bbbcf502d10c4"
+    }
+  ]
+}
+```
+
+Initial synchronization supports local Source Repositories. Duplicate
+destination names, unsupported sources, unavailable recorded commits, and
+unmanaged destination collisions fail without writing a JSON document.

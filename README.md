@@ -1,9 +1,9 @@
 # Skill Manager
 
 Skill Manager discovers coding-agent Skills in Git Source Repositories and
-persists the subset selected for subsequent use. A Skill is a tracked directory
-containing `SKILL.md`; selecting it records its identity and does not install or
-copy its files.
+persists and synchronizes the subset selected for subsequent use. A Skill is a
+tracked directory containing `SKILL.md`; selecting it records its identity,
+while synchronization materializes its tracked subtree.
 
 ## Requirements
 
@@ -102,15 +102,50 @@ skill-manager remove https://github.com/example/agent-skills --yes
 
 Removal asks for confirmation unless `--yes` is supplied.
 
+## Synchronize selected Skills
+
+Materialize every selected Skill from a local Source Repository:
+
+```console
+skill-manager sync
+```
+
+The default Synchronization Destination is `.agents/skills` relative to the
+manifest directory. Use `--manifest FILE` to read another manifest and
+`--target DIRECTORY` to choose a destination for this invocation only:
+
+```console
+skill-manager sync --manifest config/skills.toml
+skill-manager sync --manifest config/skills.toml --target ./agent-skills
+```
+
+Synchronization is non-interactive and leaves the manifest unchanged. Each
+Skill is copied from the exact `resolved_commit` recorded in the manifest, so
+uncommitted files and newer commits in a local Source Repository do not affect
+the result. Materialized Skills use flat top-level directories by Skill name.
+If a parent and Nested Skill are both selected, each is materialized
+independently with its complete tracked subtree.
+
+Duplicate Skill names and pre-existing unmanaged destination entries are
+rejected before the destination changes. `--force` never adopts or overwrites
+unmanaged entries; during initial synchronization it does not change collision
+behavior. Successful synchronization writes
+`.skill-manager-state.json` in the destination to record managed ownership,
+Skill Identity, resolved commits, and deterministic content digests. Add
+`--json` for the versioned machine-readable result.
+
 ## Contracts and errors
 
 - [`skills.toml` schema](docs/skills-toml.md)
 - [Versioned JSON contracts](docs/json-contracts.md)
+- [Synchronization destination state](docs/synchronization-state.md)
 
 Human and JSON success output is written to standard output. Diagnostics are
 written to standard error, and failures return a non-zero status. A failed JSON
 command writes no success-shaped JSON to standard output. Failed or cancelled
 selection and removal operations leave an existing manifest unchanged.
+Initial synchronization stages all source content before changing the
+destination.
 
 ## License
 

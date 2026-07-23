@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand};
 use dialoguer::{Confirm, MultiSelect};
 use skill_manager::{
     DiscoverRequest, Discovery, InteractiveSelectionPrompt, SelectRequest, SkillSelection,
-    SkillSelectionList, discover, install_cancellation_handler, list_selections,
-    prepare_source_removal, select, select_interactively,
+    SkillSelectionList, SyncRequest, SynchronizationResult, discover, install_cancellation_handler,
+    list_selections, prepare_source_removal, select, select_interactively, sync,
 };
 
 #[derive(Debug, Parser)]
@@ -69,6 +69,21 @@ enum Commands {
         /// Remove without interactive confirmation.
         #[arg(long)]
         yes: bool,
+    },
+    /// Materialize selected Skills at their recorded commits.
+    Sync {
+        /// Skill Selection manifest to synchronize.
+        #[arg(long, value_name = "FILE", default_value = "skills.toml")]
+        manifest: PathBuf,
+        /// Synchronization Destination instead of the manifest-relative default.
+        #[arg(long, value_name = "DIRECTORY")]
+        target: Option<PathBuf>,
+        /// Replace drifted managed Skills when reconciliation supports them.
+        #[arg(long)]
+        force: bool,
+        /// Emit the versioned JSON schema.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -169,6 +184,26 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Manifest: {}", removed.manifest_path);
             } else {
                 println!("Skill Selection unchanged.");
+            }
+        }
+        Commands::Sync {
+            manifest,
+            target,
+            force,
+            json,
+        } => {
+            let mut request = SyncRequest::new(manifest);
+            if let Some(target) = target {
+                request = request.with_destination(target);
+            }
+            if force {
+                request = request.with_force();
+            }
+            let result = sync(request)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print_synchronization_human(&result);
             }
         }
     }
@@ -289,5 +324,22 @@ fn print_list_human(selections: &SkillSelectionList) {
         for skill in &source.skills {
             println!("- {} ({})", skill.name, skill.path);
         }
+    }
+}
+
+fn print_synchronization_human(result: &SynchronizationResult) {
+    println!("Manifest: {}", result.manifest_path);
+    println!("Synchronization Destination: {}", result.destination);
+    if result.created.is_empty() {
+        println!("Created Skills: none");
+        return;
+    }
+
+    println!("Created Skills:");
+    for skill in &result.created {
+        println!(
+            "- {} ({}:{}; commit: {})",
+            skill.name, skill.identity.source, skill.identity.path, skill.resolved_commit
+        );
     }
 }

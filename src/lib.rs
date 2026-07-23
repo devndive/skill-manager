@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -8,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Formatted, Item, Table, Value, value};
@@ -220,6 +221,125 @@ pub struct SkillSelectionList {
     pub schema_version: u32,
     pub manifest_path: String,
     pub sources: Vec<ListedSourceRepository>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncRequest {
+    manifest_path: PathBuf,
+    destination: Option<PathBuf>,
+    force: bool,
+}
+
+impl SyncRequest {
+    pub fn new(manifest_path: impl Into<PathBuf>) -> Self {
+        Self {
+            manifest_path: manifest_path.into(),
+            destination: None,
+            force: false,
+        }
+    }
+
+    pub fn with_destination(mut self, destination: impl Into<PathBuf>) -> Self {
+        self.destination = Some(destination.into());
+        self
+    }
+
+    pub fn with_force(mut self) -> Self {
+        self.force = true;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SynchronizationResult {
+    pub schema_version: u32,
+    pub manifest_path: String,
+    pub destination: String,
+    pub created: Vec<MaterializedSkill>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MaterializedSkill {
+    pub identity: SkillIdentity,
+    pub name: String,
+    pub resolved_commit: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DestinationState<'a> {
+    state_version: u32,
+    owner: &'static str,
+    managed_skills: &'a [MaterializedSkill],
+}
+
+#[derive(Debug, Error)]
+pub enum SyncError {
+    #[error(transparent)]
+    Manifest(#[from] SelectError),
+    #[error(
+        "Source Repository '{repository}' uses unsupported type '{repository_type}'; initial Skill Synchronization supports local Source Repositories only"
+    )]
+    UnsupportedSource {
+        repository: String,
+        repository_type: &'static str,
+    },
+    #[error(
+        "selected Skills would use duplicate destination name '{name}': {first:?} and {second:?}"
+    )]
+    DuplicateDestinationName {
+        name: String,
+        first: SkillIdentity,
+        second: SkillIdentity,
+    },
+    #[error("Synchronization Destination '{path}' exists but is not a directory")]
+    DestinationNotDirectory { path: String },
+    #[error(
+        "Synchronization Destination '{path}' already contains Skill Manager state; repeated reconciliation is not yet supported"
+    )]
+    ExistingDestinationState { path: String },
+    #[error(
+        "Synchronization Destination entry '{path}' is unmanaged and cannot be overwritten, including with --force"
+    )]
+    UnmanagedCollision { path: String },
+    #[error("could not inspect Synchronization Destination '{path}': {source}")]
+    DestinationRead {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error(
+        "resolved commit '{commit}' is unavailable in local Source Repository '{repository}': {details}"
+    )]
+    CommitUnavailable {
+        repository: String,
+        commit: String,
+        details: String,
+    },
+    #[error(
+        "selected Skill '{skill}' in Source Repository '{repository}' contains unsupported tracked entry '{entry}'"
+    )]
+    UnsupportedTrackedEntry {
+        repository: String,
+        skill: String,
+        entry: String,
+    },
+    #[error("Git returned invalid data while materializing Skill '{skill}' from '{repository}'")]
+    InvalidGitOutput { repository: String, skill: String },
+    #[error("could not stage Materialized Skill '{skill}': {source}")]
+    Staging {
+        skill: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not write Synchronization Destination '{path}': {source}")]
+    DestinationWrite {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("Skill Synchronization was cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -495,6 +615,432 @@ pub fn list_selections(
         manifest_path: display_path(&manifest_path),
         sources: listed_sources,
     })
+}
+
+pub fn sync(request: SyncRequest) -> Result<SynchronizationResult, SyncError> {
+    if cancellation_requested() {
+        return Err(SyncError::Cancelled);
+    }
+
+    let manifest_path = request.manifest_path;
+    let selections = list_selections(&manifest_path)?;
+    let destination = request.destination.unwrap_or_else(|| {
+        manifest_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join(".agents/skills")
+    });
+    let _force = request.force;
+
+    let mut planned = Vec::new();
+    let mut destination_names = BTreeMap::<String, SkillIdentity>::new();
+    for source in selections.sources {
+        if source.source.repository_type != "local" {
+            return Err(SyncError::UnsupportedSource {
+                repository: source.source.path,
+                repository_type: source.source.repository_type,
+            });
+        }
+        for skill in source.skills {
+            if let Some(first) =
+                destination_names.insert(skill.name.clone(), skill.identity.clone())
+            {
+                return Err(SyncError::DuplicateDestinationName {
+                    name: skill.name,
+                    first,
+                    second: skill.identity,
+                });
+            }
+            planned.push(PlannedMaterialization {
+                source_path: PathBuf::from(&source.source.path),
+                identity: skill.identity,
+                name: skill.name,
+                skill_path: skill.path,
+                resolved_commit: source.resolved_commit.clone(),
+            });
+        }
+    }
+    planned.sort_by(|left, right| left.name.cmp(&right.name));
+
+    preflight_destination(&destination, &planned)?;
+
+    let staged = TempDir::new().map_err(|source| SyncError::DestinationWrite {
+        path: display_path(&destination),
+        source,
+    })?;
+    let mut created = Vec::with_capacity(planned.len());
+    for materialization in &planned {
+        if cancellation_requested() {
+            return Err(SyncError::Cancelled);
+        }
+        let staged_skill = staged.path().join(&materialization.name);
+        let digest = stage_materialized_skill(materialization, &staged_skill)?;
+        created.push(MaterializedSkill {
+            identity: materialization.identity.clone(),
+            name: materialization.name.clone(),
+            resolved_commit: materialization.resolved_commit.clone(),
+            digest,
+        });
+    }
+
+    let state = serde_json::to_vec_pretty(&DestinationState {
+        state_version: 1,
+        owner: "skill-manager",
+        managed_skills: &created,
+    })
+    .expect("destination state contains only serializable values");
+    commit_initial_synchronization(&destination, staged.path(), &state, &created)?;
+
+    Ok(SynchronizationResult {
+        schema_version: 1,
+        manifest_path: display_path(&manifest_path),
+        destination: display_path(&destination),
+        created,
+    })
+}
+
+struct PlannedMaterialization {
+    source_path: PathBuf,
+    identity: SkillIdentity,
+    name: String,
+    skill_path: String,
+    resolved_commit: String,
+}
+
+fn preflight_destination(
+    destination: &Path,
+    planned: &[PlannedMaterialization],
+) -> Result<(), SyncError> {
+    match fs::metadata(destination) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(SyncError::DestinationNotDirectory {
+                path: display_path(destination),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(SyncError::DestinationRead {
+                path: display_path(destination),
+                source,
+            });
+        }
+    }
+
+    let state_path = destination.join(".skill-manager-state.json");
+    if state_path.exists() {
+        return Err(SyncError::ExistingDestinationState {
+            path: display_path(destination),
+        });
+    }
+    for materialization in planned {
+        let path = destination.join(&materialization.name);
+        if path.exists() {
+            return Err(SyncError::UnmanagedCollision {
+                path: display_path(&path),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn stage_materialized_skill(
+    materialization: &PlannedMaterialization,
+    destination: &Path,
+) -> Result<String, SyncError> {
+    let commit_expression = format!("{}^{{commit}}", materialization.resolved_commit);
+    let commit = git_text(
+        &materialization.source_path,
+        [
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            commit_expression.as_str(),
+        ],
+    )
+    .map_err(|error| synchronization_git_error(error, materialization))?;
+    if commit != materialization.resolved_commit {
+        return Err(SyncError::CommitUnavailable {
+            repository: materialization.identity.source.clone(),
+            commit: materialization.resolved_commit.clone(),
+            details: format!("Git resolved the value to unexpected commit '{commit}'"),
+        });
+    }
+
+    let pathspec = format!(":(literal){}", materialization.skill_path);
+    let tree = if materialization.skill_path == "." {
+        git_bytes(
+            &materialization.source_path,
+            [
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                materialization.resolved_commit.as_str(),
+            ],
+        )
+    } else {
+        git_bytes(
+            &materialization.source_path,
+            [
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                materialization.resolved_commit.as_str(),
+                "--",
+                pathspec.as_str(),
+            ],
+        )
+    }
+    .map_err(|error| synchronization_git_error(error, materialization))?;
+
+    fs::create_dir(destination).map_err(|source| SyncError::Staging {
+        skill: materialization.name.clone(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut found_skill = false;
+    for entry in tree
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let separator = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(|| SyncError::InvalidGitOutput {
+                repository: materialization.identity.source.clone(),
+                skill: materialization.skill_path.clone(),
+            })?;
+        let metadata =
+            std::str::from_utf8(&entry[..separator]).map_err(|_| SyncError::InvalidGitOutput {
+                repository: materialization.identity.source.clone(),
+                skill: materialization.skill_path.clone(),
+            })?;
+        let path = std::str::from_utf8(&entry[separator + 1..]).map_err(|_| {
+            SyncError::InvalidGitOutput {
+                repository: materialization.identity.source.clone(),
+                skill: materialization.skill_path.clone(),
+            }
+        })?;
+        let mut metadata = metadata.split_whitespace();
+        let mode = metadata.next().ok_or_else(|| SyncError::InvalidGitOutput {
+            repository: materialization.identity.source.clone(),
+            skill: materialization.skill_path.clone(),
+        })?;
+        let object_type = metadata.next().ok_or_else(|| SyncError::InvalidGitOutput {
+            repository: materialization.identity.source.clone(),
+            skill: materialization.skill_path.clone(),
+        })?;
+        let object = metadata.next().ok_or_else(|| SyncError::InvalidGitOutput {
+            repository: materialization.identity.source.clone(),
+            skill: materialization.skill_path.clone(),
+        })?;
+        if !matches!(mode, "100644" | "100755") || object_type != "blob" {
+            return Err(SyncError::UnsupportedTrackedEntry {
+                repository: materialization.identity.source.clone(),
+                skill: materialization.skill_path.clone(),
+                entry: path.to_owned(),
+            });
+        }
+
+        let relative = if materialization.skill_path == "." {
+            path
+        } else {
+            path.strip_prefix(&materialization.skill_path)
+                .and_then(|path| path.strip_prefix('/'))
+                .ok_or_else(|| SyncError::InvalidGitOutput {
+                    repository: materialization.identity.source.clone(),
+                    skill: materialization.skill_path.clone(),
+                })?
+        };
+        if relative == "SKILL.md" {
+            found_skill = true;
+        }
+        let contents = git_bytes(&materialization.source_path, ["cat-file", "blob", object])
+            .map_err(|error| synchronization_git_error(error, materialization))?;
+        let output_path = destination.join(relative);
+        fs::create_dir_all(output_path.parent().expect("a file has a parent"))
+            .and_then(|()| fs::write(&output_path, &contents))
+            .map_err(|source| SyncError::Staging {
+                skill: materialization.name.clone(),
+                source,
+            })?;
+        set_executable(&output_path, mode == "100755").map_err(|source| SyncError::Staging {
+            skill: materialization.name.clone(),
+            source,
+        })?;
+
+        update_materialized_digest(&mut hasher, relative, mode, &contents);
+    }
+    if !found_skill {
+        return Err(SyncError::CommitUnavailable {
+            repository: materialization.identity.source.clone(),
+            commit: materialization.resolved_commit.clone(),
+            details: format!(
+                "selected Skill '{}' is absent at the recorded commit",
+                materialization.skill_path
+            ),
+        });
+    }
+
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn synchronization_git_error(
+    error: GitFailure,
+    materialization: &PlannedMaterialization,
+) -> SyncError {
+    let details = match error {
+        GitFailure::Unavailable(error) => error.to_string(),
+        GitFailure::Failed(details) => details,
+        GitFailure::InvalidUtf8 => "Git returned invalid UTF-8".to_owned(),
+        GitFailure::Cancelled => return SyncError::Cancelled,
+    };
+    SyncError::CommitUnavailable {
+        repository: materialization.identity.source.clone(),
+        commit: materialization.resolved_commit.clone(),
+        details,
+    }
+}
+
+fn update_materialized_digest(hasher: &mut Sha256, path: &str, mode: &str, contents: &[u8]) {
+    hasher.update((path.len() as u64).to_be_bytes());
+    hasher.update(path.as_bytes());
+    hasher.update((mode.len() as u64).to_be_bytes());
+    hasher.update(mode.as_bytes());
+    hasher.update((contents.len() as u64).to_be_bytes());
+    hasher.update(contents);
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path, executable: bool) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    let mode = permissions.mode();
+    permissions.set_mode(if executable {
+        mode | 0o111
+    } else {
+        mode & !0o111
+    });
+    fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path, _executable: bool) -> io::Result<()> {
+    Ok(())
+}
+
+fn commit_initial_synchronization(
+    destination: &Path,
+    staged: &Path,
+    state: &[u8],
+    created: &[MaterializedSkill],
+) -> Result<(), SyncError> {
+    if cancellation_requested() {
+        return Err(SyncError::Cancelled);
+    }
+    preflight_destination(
+        destination,
+        &created
+            .iter()
+            .map(|skill| PlannedMaterialization {
+                source_path: PathBuf::new(),
+                identity: skill.identity.clone(),
+                name: skill.name.clone(),
+                skill_path: skill.identity.path.clone(),
+                resolved_commit: skill.resolved_commit.clone(),
+            })
+            .collect::<Vec<_>>(),
+    )?;
+
+    let destination_parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(destination_parent).map_err(|source| SyncError::DestinationWrite {
+        path: display_path(destination),
+        source,
+    })?;
+    let commit_stage =
+        TempDir::new_in(destination_parent).map_err(|source| SyncError::DestinationWrite {
+            path: display_path(destination),
+            source,
+        })?;
+    for skill in created {
+        copy_directory(
+            &staged.join(&skill.name),
+            &commit_stage.path().join(&skill.name),
+        )
+        .map_err(|source| SyncError::DestinationWrite {
+            path: display_path(destination),
+            source,
+        })?;
+    }
+    fs::write(commit_stage.path().join(".skill-manager-state.json"), state).map_err(|source| {
+        SyncError::DestinationWrite {
+            path: display_path(destination),
+            source,
+        }
+    })?;
+
+    if !destination.exists() {
+        return fs::rename(commit_stage.path(), destination).map_err(|source| {
+            SyncError::DestinationWrite {
+                path: display_path(destination),
+                source,
+            }
+        });
+    }
+
+    let mut committed = Vec::new();
+    for skill in created {
+        let target = destination.join(&skill.name);
+        if let Err(source) = fs::rename(commit_stage.path().join(&skill.name), &target) {
+            rollback_created_entries(&committed);
+            return Err(SyncError::DestinationWrite {
+                path: display_path(destination),
+                source,
+            });
+        }
+        committed.push(target);
+    }
+    let state_path = destination.join(".skill-manager-state.json");
+    if let Err(source) = fs::rename(
+        commit_stage.path().join(".skill-manager-state.json"),
+        &state_path,
+    ) {
+        rollback_created_entries(&committed);
+        return Err(SyncError::DestinationWrite {
+            path: display_path(destination),
+            source,
+        });
+    }
+    Ok(())
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_directory(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path)?;
+            fs::set_permissions(&destination_path, fs::metadata(&source_path)?.permissions())?;
+        }
+    }
+    Ok(())
+}
+
+fn rollback_created_entries(paths: &[PathBuf]) {
+    for path in paths.iter().rev() {
+        let _ = fs::remove_dir_all(path);
+    }
 }
 
 pub fn prepare_source_removal(
