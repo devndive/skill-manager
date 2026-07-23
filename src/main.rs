@@ -331,11 +331,11 @@ fn print_synchronization_human(result: &SynchronizationResult) {
     println!("Manifest: {}", result.manifest_path);
     println!("Synchronization Destination: {}", result.destination);
     if result.created.is_empty() {
-        println!("Created Skills: none");
+        println!("Created Materialized Skills: none");
         return;
     }
 
-    println!("Created Skills:");
+    println!("Created Materialized Skills:");
     for skill in &result.created {
         println!(
             "- {} ({}:{}; commit: {})",

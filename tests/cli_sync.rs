@@ -36,7 +36,7 @@ fn cli_sync_uses_the_manifest_relative_default_destination() {
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         format!(
-            "Manifest: {}\nSynchronization Destination: {}\nCreated Skills:\n- alpha ({}:alpha; commit: {commit})\n",
+            "Manifest: {}\nSynchronization Destination: {}\nCreated Materialized Skills:\n- alpha ({}:alpha; commit: {commit})\n",
             manifest_path.display(),
             destination.display(),
             fs::canonicalize(repository.path()).unwrap().display(),

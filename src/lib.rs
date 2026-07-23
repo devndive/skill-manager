@@ -663,7 +663,12 @@ pub fn sync(request: SyncRequest) -> Result<SynchronizationResult, SyncError> {
     }
     planned.sort_by(|left, right| left.name.cmp(&right.name));
 
-    preflight_destination(&destination, &planned)?;
+    preflight_destination(
+        &destination,
+        planned
+            .iter()
+            .map(|materialization| materialization.name.as_str()),
+    )?;
 
     let staged = TempDir::new().map_err(|source| SyncError::DestinationWrite {
         path: display_path(&destination),
@@ -708,9 +713,9 @@ struct PlannedMaterialization {
     resolved_commit: String,
 }
 
-fn preflight_destination(
+fn preflight_destination<'a>(
     destination: &Path,
-    planned: &[PlannedMaterialization],
+    destination_names: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), SyncError> {
     match fs::metadata(destination) {
         Ok(metadata) if !metadata.is_dir() => {
@@ -734,8 +739,8 @@ fn preflight_destination(
             path: display_path(destination),
         });
     }
-    for materialization in planned {
-        let path = destination.join(&materialization.name);
+    for name in destination_names {
+        let path = destination.join(name);
         if path.exists() {
             return Err(SyncError::UnmanagedCollision {
                 path: display_path(&path),
@@ -809,34 +814,21 @@ fn stage_materialized_skill(
         let separator = entry
             .iter()
             .position(|byte| *byte == b'\t')
-            .ok_or_else(|| SyncError::InvalidGitOutput {
-                repository: materialization.identity.source.clone(),
-                skill: materialization.skill_path.clone(),
-            })?;
-        let metadata =
-            std::str::from_utf8(&entry[..separator]).map_err(|_| SyncError::InvalidGitOutput {
-                repository: materialization.identity.source.clone(),
-                skill: materialization.skill_path.clone(),
-            })?;
-        let path = std::str::from_utf8(&entry[separator + 1..]).map_err(|_| {
-            SyncError::InvalidGitOutput {
-                repository: materialization.identity.source.clone(),
-                skill: materialization.skill_path.clone(),
-            }
-        })?;
+            .ok_or_else(|| invalid_materialization_git_output(materialization))?;
+        let metadata = std::str::from_utf8(&entry[..separator])
+            .map_err(|_| invalid_materialization_git_output(materialization))?;
+        let path = std::str::from_utf8(&entry[separator + 1..])
+            .map_err(|_| invalid_materialization_git_output(materialization))?;
         let mut metadata = metadata.split_whitespace();
-        let mode = metadata.next().ok_or_else(|| SyncError::InvalidGitOutput {
-            repository: materialization.identity.source.clone(),
-            skill: materialization.skill_path.clone(),
-        })?;
-        let object_type = metadata.next().ok_or_else(|| SyncError::InvalidGitOutput {
-            repository: materialization.identity.source.clone(),
-            skill: materialization.skill_path.clone(),
-        })?;
-        let object = metadata.next().ok_or_else(|| SyncError::InvalidGitOutput {
-            repository: materialization.identity.source.clone(),
-            skill: materialization.skill_path.clone(),
-        })?;
+        let mode = metadata
+            .next()
+            .ok_or_else(|| invalid_materialization_git_output(materialization))?;
+        let object_type = metadata
+            .next()
+            .ok_or_else(|| invalid_materialization_git_output(materialization))?;
+        let object = metadata
+            .next()
+            .ok_or_else(|| invalid_materialization_git_output(materialization))?;
         if !matches!(mode, "100644" | "100755") || object_type != "blob" {
             return Err(SyncError::UnsupportedTrackedEntry {
                 repository: materialization.identity.source.clone(),
@@ -850,10 +842,7 @@ fn stage_materialized_skill(
         } else {
             path.strip_prefix(&materialization.skill_path)
                 .and_then(|path| path.strip_prefix('/'))
-                .ok_or_else(|| SyncError::InvalidGitOutput {
-                    repository: materialization.identity.source.clone(),
-                    skill: materialization.skill_path.clone(),
-                })?
+                .ok_or_else(|| invalid_materialization_git_output(materialization))?
         };
         if relative == "SKILL.md" {
             found_skill = true;
@@ -886,6 +875,13 @@ fn stage_materialized_skill(
     }
 
     Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn invalid_materialization_git_output(materialization: &PlannedMaterialization) -> SyncError {
+    SyncError::InvalidGitOutput {
+        repository: materialization.identity.source.clone(),
+        skill: materialization.skill_path.clone(),
+    }
 }
 
 fn synchronization_git_error(
@@ -942,19 +938,7 @@ fn commit_initial_synchronization(
     if cancellation_requested() {
         return Err(SyncError::Cancelled);
     }
-    preflight_destination(
-        destination,
-        &created
-            .iter()
-            .map(|skill| PlannedMaterialization {
-                source_path: PathBuf::new(),
-                identity: skill.identity.clone(),
-                name: skill.name.clone(),
-                skill_path: skill.identity.path.clone(),
-                resolved_commit: skill.resolved_commit.clone(),
-            })
-            .collect::<Vec<_>>(),
-    )?;
+    preflight_destination(destination, created.iter().map(|skill| skill.name.as_str()))?;
 
     let destination_parent = destination
         .parent()
