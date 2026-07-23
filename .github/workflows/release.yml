@@ -16,7 +16,7 @@ jobs:
     name: Validate release tag
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@1.85.0
       - name: Match tag to package version
         shell: bash
@@ -70,7 +70,7 @@ jobs:
             rustflags: "-C link-arg=/Brepro"
             rustflags_variable: CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           targets: ${{ matrix.target }}
@@ -115,7 +115,7 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.1
         with:
           path: dist
           merge-multiple: true
