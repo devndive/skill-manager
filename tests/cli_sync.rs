@@ -131,3 +131,28 @@ fn cli_sync_failure_writes_no_success_shaped_json() {
     );
     assert!(!manifest_directory.path().join(".agents/skills").exists());
 }
+
+#[test]
+fn cli_sync_reports_when_git_is_unavailable() {
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    fs::write(
+        &manifest_path,
+        "manifest_version = 1\n\n[[sources]]\ntype = \"local\"\npath = \".\"\nrequested_revision = \"HEAD\"\nresolved_commit = \"0123456789abcdef\"\nskills = [\"alpha\"]\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
+        .args(["sync", "--manifest", manifest_path.to_str().unwrap()])
+        .env("PATH", "")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("Git is required but could not be executed")
+    );
+}

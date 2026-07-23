@@ -277,6 +277,8 @@ struct DestinationState<'a> {
 pub enum SyncError {
     #[error(transparent)]
     Manifest(#[from] SelectError),
+    #[error("Git is required but could not be executed: {0}")]
+    GitUnavailable(#[source] io::Error),
     #[error(
         "Source Repository '{repository}' uses unsupported type '{repository_type}'; initial Skill Synchronization supports local Source Repositories only"
     )]
@@ -888,16 +890,15 @@ fn synchronization_git_error(
     error: GitFailure,
     materialization: &PlannedMaterialization,
 ) -> SyncError {
-    let details = match error {
-        GitFailure::Unavailable(error) => error.to_string(),
-        GitFailure::Failed(details) => details,
-        GitFailure::InvalidUtf8 => "Git returned invalid UTF-8".to_owned(),
-        GitFailure::Cancelled => return SyncError::Cancelled,
-    };
-    SyncError::CommitUnavailable {
-        repository: materialization.identity.source.clone(),
-        commit: materialization.resolved_commit.clone(),
-        details,
+    match error {
+        GitFailure::Unavailable(error) => SyncError::GitUnavailable(error),
+        GitFailure::Failed(details) => SyncError::CommitUnavailable {
+            repository: materialization.identity.source.clone(),
+            commit: materialization.resolved_commit.clone(),
+            details,
+        },
+        GitFailure::InvalidUtf8 => invalid_materialization_git_output(materialization),
+        GitFailure::Cancelled => SyncError::Cancelled,
     }
 }
 
