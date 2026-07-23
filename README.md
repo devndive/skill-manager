@@ -127,9 +127,24 @@ If a parent and Nested Skill are both selected, each is materialized
 independently with its complete tracked subtree.
 
 Duplicate Skill names and pre-existing unmanaged destination entries are
-rejected before the destination changes. `--force` never adopts or overwrites
-unmanaged entries; during initial synchronization it does not change collision
-behavior. Successful synchronization writes
+rejected before the destination changes. Later runs reconcile the complete
+manifest and report created, updated, removed, and unchanged Materialized
+Skills. A clean Skill whose identity, resolved commit, recorded state, and
+on-disk digest still match is reported unchanged without accessing its Source
+Repository.
+
+Local additions, removals, content changes, and executable-mode changes inside
+a managed Skill are Materialized Skill Drift. Drift stops synchronization
+before destination changes. Use `--force` to replace or remove drifted entries
+that are already recorded as managed:
+
+```console
+skill-manager sync --force
+```
+
+`--force` never adopts or overwrites unmanaged entries. A missing managed Skill
+is recreated without requiring force because no existing content is replaced.
+Successful synchronization writes
 `.skill-manager-state.json` in the destination to record managed ownership,
 Skill Identity, resolved commits, and deterministic content digests. Add
 `--json` for the versioned machine-readable result.
@@ -144,8 +159,9 @@ Human and JSON success output is written to standard output. Diagnostics are
 written to standard error, and failures return a non-zero status. A failed JSON
 command writes no success-shaped JSON to standard output. Failed or cancelled
 selection and removal operations leave an existing manifest unchanged.
-Initial synchronization stages all source content before changing the
-destination.
+Synchronization stages all required source content before changing the
+destination. Reported source, staging, filesystem, and state-write failures
+restore the previous managed entries and destination state.
 
 ## License
 

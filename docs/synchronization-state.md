@@ -1,6 +1,6 @@
 # Synchronization destination state
 
-Every successful initial Skill Synchronization writes
+Every successful Skill Synchronization writes
 `.skill-manager-state.json` in the Synchronization Destination. The file is
 owned by Skill Manager and records which top-level entries are Materialized
 Skills; unrelated destination entries remain unmanaged.
@@ -47,3 +47,14 @@ unambiguous and independent of the current worktree.
 
 The state file is not part of `skills.toml`; using `--target` never changes the
 manifest or persists a destination choice.
+
+Repeated synchronization compares each recorded digest with the current
+on-disk Materialized Skill before changing the destination. Matching identity,
+resolved commit, state, and digest allow the Skill to be reported unchanged
+without Source Repository access. A missing managed directory is not drift and
+is recreated when still selected.
+
+Digest mismatches are Materialized Skill Drift. Without `--force`, any drifted
+managed entry stops the complete reconciliation before mutation. With
+`--force`, only entries already listed in `managed_skills` may be replaced or
+removed. Destination entries absent from state remain unmanaged and protected.

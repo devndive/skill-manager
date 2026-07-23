@@ -185,8 +185,13 @@ The top-level object contains:
 - `destination`: the explicit target or the manifest-relative
   `.agents/skills` default.
 - `created`: newly Materialized Skills ordered by destination name.
+- `updated`: replaced or recreated managed Skills ordered by destination name.
+- `removed`: formerly managed Skills no longer selected, ordered by destination
+  name.
+- `unchanged`: clean managed Skills whose recorded identity, commit, and digest
+  still match, ordered by destination name.
 
-Each created Skill contains its Skill Identity, destination `name`, recorded
+Each classified Skill contains its Skill Identity, destination `name`, recorded
 `resolved_commit`, and deterministic `sha256:` content digest:
 
 ```json
@@ -204,10 +209,14 @@ Each created Skill contains its Skill Identity, destination `name`, recorded
       "resolved_commit": "89abcdef0123456789abcdef0123456789abcdef",
       "digest": "sha256:17f1f9b14f0f13e734a5d7781a9f6a7b732c3e61c1f4e10a506bbbcf502d10c4"
     }
-  ]
+  ],
+  "updated": [],
+  "removed": [],
+  "unchanged": []
 }
 ```
 
-Initial synchronization supports local Source Repositories. Duplicate
-destination names, unsupported sources, unavailable recorded commits, and
-unmanaged destination collisions fail without writing a JSON document.
+Synchronization supports local Source Repositories. Duplicate destination
+names, unsupported sources, unavailable recorded commits, unmanaged
+destination collisions, and Materialized Skill Drift without `--force` fail
+without writing a JSON document.

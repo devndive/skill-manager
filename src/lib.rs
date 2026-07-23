@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
@@ -99,7 +99,7 @@ pub struct Skill {
     pub parent_path: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillIdentity {
     pub source: String,
     pub path: String,
@@ -256,9 +256,12 @@ pub struct SynchronizationResult {
     pub manifest_path: String,
     pub destination: String,
     pub created: Vec<MaterializedSkill>,
+    pub updated: Vec<MaterializedSkill>,
+    pub removed: Vec<MaterializedSkill>,
+    pub unchanged: Vec<MaterializedSkill>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterializedSkill {
     pub identity: SkillIdentity,
     pub name: String,
@@ -266,11 +269,11 @@ pub struct MaterializedSkill {
     pub digest: String,
 }
 
-#[derive(Debug, Serialize)]
-struct DestinationState<'a> {
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DestinationState {
     state_version: u32,
-    owner: &'static str,
-    managed_skills: &'a [MaterializedSkill],
+    owner: String,
+    managed_skills: Vec<MaterializedSkill>,
 }
 
 #[derive(Debug, Error)]
@@ -280,7 +283,7 @@ pub enum SyncError {
     #[error("Git is required but could not be executed: {0}")]
     GitUnavailable(#[source] io::Error),
     #[error(
-        "Source Repository '{repository}' uses unsupported type '{repository_type}'; initial Skill Synchronization supports local Source Repositories only"
+        "Source Repository '{repository}' uses unsupported type '{repository_type}'; Skill Synchronization supports local Source Repositories only"
     )]
     UnsupportedSource {
         repository: String,
@@ -296,10 +299,16 @@ pub enum SyncError {
     },
     #[error("Synchronization Destination '{path}' exists but is not a directory")]
     DestinationNotDirectory { path: String },
+    #[error("Synchronization Destination state '{path}' is invalid: {details}")]
+    InvalidDestinationState { path: String, details: String },
     #[error(
-        "Synchronization Destination '{path}' already contains Skill Manager state; repeated reconciliation is not yet supported"
+        "Materialized Skill '{skill}' has drift at '{path}'; rerun with --force to replace or remove this managed content"
     )]
-    ExistingDestinationState { path: String },
+    MaterializedSkillDrift { skill: String, path: String },
+    #[error(
+        "Synchronization Destination entry '{path}' changed while source content was being staged; retry synchronization"
+    )]
+    DestinationChangedDuringSynchronization { path: String },
     #[error(
         "Synchronization Destination entry '{path}' is unmanaged and cannot be overwritten, including with --force"
     )]
@@ -339,6 +348,11 @@ pub enum SyncError {
         path: String,
         #[source]
         source: io::Error,
+    },
+    #[error("{operation}; additionally, rollback failed: {rollback}")]
+    Rollback {
+        operation: Box<SyncError>,
+        rollback: io::Error,
     },
     #[error("Skill Synchronization was cancelled")]
     Cancelled,
@@ -633,7 +647,7 @@ pub fn sync(request: SyncRequest) -> Result<SynchronizationResult, SyncError> {
             .unwrap_or_else(|| Path::new("."))
             .join(".agents/skills")
     });
-    let _force = request.force;
+    let force = request.force;
 
     let mut planned = Vec::new();
     let mut destination_names = BTreeMap::<String, SkillIdentity>::new();
@@ -665,45 +679,107 @@ pub fn sync(request: SyncRequest) -> Result<SynchronizationResult, SyncError> {
     }
     planned.sort_by(|left, right| left.name.cmp(&right.name));
 
-    preflight_destination(
-        &destination,
-        planned
-            .iter()
-            .map(|materialization| materialization.name.as_str()),
-    )?;
+    ensure_destination_directory(&destination)?;
+    let previous_state = load_destination_state(&destination)?;
+    let mut recorded = previous_state
+        .as_ref()
+        .map(|state| {
+            state
+                .managed_skills
+                .iter()
+                .cloned()
+                .map(|skill| (skill.name.clone(), skill))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let mut created_plans = Vec::new();
+    let mut updated_plans = Vec::new();
+    let mut removed = Vec::new();
+    let mut unchanged = Vec::new();
+    let mut observed_materialized_skills = BTreeMap::new();
+    for materialization in planned {
+        if let Some(recorded_skill) = recorded.remove(&materialization.name) {
+            let path = destination.join(&materialization.name);
+            let contents = inspect_materialized_skill(&recorded_skill, &path, force)?;
+            let has_recorded_contents = contents.has_digest(&recorded_skill.digest);
+            observed_materialized_skills.insert(materialization.name.clone(), contents);
+            if has_recorded_contents
+                && recorded_skill.identity == materialization.identity
+                && recorded_skill.resolved_commit == materialization.resolved_commit
+            {
+                unchanged.push(recorded_skill);
+            } else {
+                updated_plans.push(materialization);
+            }
+        } else {
+            ensure_unmanaged_entry_absent(&destination.join(&materialization.name))?;
+            created_plans.push(materialization);
+        }
+    }
+    for (_, recorded_skill) in recorded {
+        let path = destination.join(&recorded_skill.name);
+        let contents = inspect_materialized_skill(&recorded_skill, &path, force)?;
+        observed_materialized_skills.insert(recorded_skill.name.clone(), contents);
+        removed.push(recorded_skill);
+    }
 
     let staged = TempDir::new().map_err(|source| SyncError::DestinationWrite {
         path: display_path(&destination),
         source,
     })?;
-    let mut created = Vec::with_capacity(planned.len());
-    for materialization in &planned {
-        if cancellation_requested() {
-            return Err(SyncError::Cancelled);
-        }
-        let staged_skill = staged.path().join(&materialization.name);
-        let digest = stage_materialized_skill(materialization, &staged_skill)?;
-        created.push(MaterializedSkill {
-            identity: materialization.identity.clone(),
-            name: materialization.name.clone(),
-            resolved_commit: materialization.resolved_commit.clone(),
-            digest,
+    let mut created = stage_materializations(&created_plans, staged.path())?;
+    let mut updated = stage_materializations(&updated_plans, staged.path())?;
+    created.sort_by(|left, right| left.name.cmp(&right.name));
+    updated.sort_by(|left, right| left.name.cmp(&right.name));
+    removed.sort_by(|left, right| left.name.cmp(&right.name));
+    unchanged.sort_by(|left, right| left.name.cmp(&right.name));
+
+    if previous_state.is_some()
+        && created_plans.is_empty()
+        && updated_plans.is_empty()
+        && removed.is_empty()
+    {
+        return Ok(SynchronizationResult {
+            schema_version: 1,
+            manifest_path: display_path(&manifest_path),
+            destination: display_path(&destination),
+            created: Vec::new(),
+            updated: Vec::new(),
+            removed,
+            unchanged,
         });
     }
 
+    let mut managed_skills = Vec::with_capacity(created.len() + updated.len() + unchanged.len());
+    managed_skills.extend(created.iter().cloned());
+    managed_skills.extend(updated.iter().cloned());
+    managed_skills.extend(unchanged.iter().cloned());
+    managed_skills.sort_by(|left, right| left.name.cmp(&right.name));
     let state = serde_json::to_vec_pretty(&DestinationState {
         state_version: 1,
-        owner: "skill-manager",
-        managed_skills: &created,
+        owner: "skill-manager".to_owned(),
+        managed_skills,
     })
     .expect("destination state contains only serializable values");
-    commit_initial_synchronization(&destination, staged.path(), &state, &created)?;
+    commit_synchronization(
+        &destination,
+        staged.path(),
+        &state,
+        &created,
+        &updated,
+        &removed,
+        previous_state.as_ref(),
+        &observed_materialized_skills,
+    )?;
 
     Ok(SynchronizationResult {
         schema_version: 1,
         manifest_path: display_path(&manifest_path),
         destination: display_path(&destination),
         created,
+        updated,
+        removed,
+        unchanged,
     })
 }
 
@@ -715,10 +791,215 @@ struct PlannedMaterialization {
     resolved_commit: String,
 }
 
-fn preflight_destination<'a>(
-    destination: &Path,
-    destination_names: impl IntoIterator<Item = &'a str>,
-) -> Result<(), SyncError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MaterializedSkillContents {
+    Missing,
+    Digest(String),
+    UnsupportedEntry(String),
+}
+
+impl MaterializedSkillContents {
+    fn has_digest(&self, expected: &str) -> bool {
+        matches!(self, Self::Digest(digest) if digest == expected)
+    }
+
+    fn is_drifted(&self, expected: &str) -> bool {
+        !matches!(self, Self::Missing) && !self.has_digest(expected)
+    }
+}
+
+fn inspect_materialized_skill(
+    recorded_skill: &MaterializedSkill,
+    path: &Path,
+    force: bool,
+) -> Result<MaterializedSkillContents, SyncError> {
+    let contents = materialized_skill_contents(path)?;
+    if contents.is_drifted(&recorded_skill.digest) && !force {
+        return Err(SyncError::MaterializedSkillDrift {
+            skill: recorded_skill.name.clone(),
+            path: display_path(path),
+        });
+    }
+    Ok(contents)
+}
+
+fn load_destination_state(destination: &Path) -> Result<Option<DestinationState>, SyncError> {
+    let state_path = destination.join(".skill-manager-state.json");
+    let contents = match fs::read(&state_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(SyncError::DestinationRead {
+                path: display_path(&state_path),
+                source,
+            });
+        }
+    };
+    let state: DestinationState =
+        serde_json::from_slice(&contents).map_err(|error| SyncError::InvalidDestinationState {
+            path: display_path(&state_path),
+            details: error.to_string(),
+        })?;
+    if state.state_version != 1 || state.owner != "skill-manager" {
+        return Err(SyncError::InvalidDestinationState {
+            path: display_path(&state_path),
+            details: "expected state_version 1 owned by 'skill-manager'".to_owned(),
+        });
+    }
+    let mut names = BTreeSet::new();
+    for skill in &state.managed_skills {
+        if !is_destination_name(&skill.name) {
+            return Err(SyncError::InvalidDestinationState {
+                path: display_path(&state_path),
+                details: format!(
+                    "managed Skill name '{}' is not a safe top-level entry",
+                    skill.name
+                ),
+            });
+        }
+        if !names.insert(skill.name.as_str()) {
+            return Err(SyncError::InvalidDestinationState {
+                path: display_path(&state_path),
+                details: "managed Skill names must be unique".to_owned(),
+            });
+        }
+        if !is_hex_identifier(&skill.resolved_commit, &[40, 64]) {
+            return Err(SyncError::InvalidDestinationState {
+                path: display_path(&state_path),
+                details: format!(
+                    "managed Skill '{}' has an invalid resolved commit",
+                    skill.name
+                ),
+            });
+        }
+        let digest = skill.digest.strip_prefix("sha256:").unwrap_or_default();
+        if !is_hex_identifier(digest, &[64]) {
+            return Err(SyncError::InvalidDestinationState {
+                path: display_path(&state_path),
+                details: format!("managed Skill '{}' has an invalid digest", skill.name),
+            });
+        }
+    }
+    Ok(Some(state))
+}
+
+fn is_hex_identifier(value: &str, lengths: &[usize]) -> bool {
+    lengths.contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn materialized_skill_contents(skill_path: &Path) -> Result<MaterializedSkillContents, SyncError> {
+    let metadata = match fs::symlink_metadata(skill_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(MaterializedSkillContents::Missing);
+        }
+        Err(source) => {
+            return Err(SyncError::DestinationRead {
+                path: display_path(skill_path),
+                source,
+            });
+        }
+    };
+    if !metadata.is_dir() {
+        return Ok(MaterializedSkillContents::UnsupportedEntry(display_path(
+            skill_path,
+        )));
+    }
+
+    let mut files = Vec::new();
+    let mut unsupported = None;
+    collect_materialized_files(skill_path, skill_path, &mut files, &mut unsupported)?;
+    if let Some(path) = unsupported {
+        return Ok(MaterializedSkillContents::UnsupportedEntry(path));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, path, mode) in files {
+        let contents = fs::read(&path).map_err(|source| SyncError::DestinationRead {
+            path: display_path(&path),
+            source,
+        })?;
+        update_materialized_digest(&mut hasher, &relative, mode, &contents);
+    }
+    Ok(MaterializedSkillContents::Digest(format!(
+        "sha256:{:x}",
+        hasher.finalize()
+    )))
+}
+
+fn collect_materialized_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<(String, PathBuf, &'static str)>,
+    unsupported: &mut Option<String>,
+) -> Result<bool, SyncError> {
+    let entries = fs::read_dir(directory).map_err(|source| SyncError::DestinationRead {
+        path: display_path(directory),
+        source,
+    })?;
+    let mut has_entries = false;
+    for entry in entries {
+        has_entries = true;
+        let entry = entry.map_err(|source| SyncError::DestinationRead {
+            path: display_path(directory),
+            source,
+        })?;
+        let path = entry.path();
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|source| SyncError::DestinationRead {
+                path: display_path(&path),
+                source,
+            })?;
+        if metadata.is_dir() {
+            if !collect_materialized_files(root, &path, files, unsupported)? {
+                *unsupported = Some(display_path(&path));
+            }
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .expect("collected path is below root");
+            let Some(relative) = digest_path(relative) else {
+                *unsupported = Some(display_path(&path));
+                continue;
+            };
+            files.push((relative, path, materialized_file_mode(&metadata)));
+        } else {
+            *unsupported = Some(display_path(&path));
+        }
+    }
+    Ok(has_entries)
+}
+
+fn digest_path(path: &Path) -> Option<String> {
+    path.components()
+        .map(|component| match component {
+            Component::Normal(component) => component.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|components| components.join("/"))
+}
+
+#[cfg(unix)]
+fn materialized_file_mode(metadata: &fs::Metadata) -> &'static str {
+    use std::os::unix::fs::PermissionsExt;
+
+    if metadata.permissions().mode() & 0o111 == 0 {
+        "100644"
+    } else {
+        "100755"
+    }
+}
+
+#[cfg(not(unix))]
+fn materialized_file_mode(_metadata: &fs::Metadata) -> &'static str {
+    "100644"
+}
+
+fn ensure_destination_directory(destination: &Path) -> Result<(), SyncError> {
     match fs::metadata(destination) {
         Ok(metadata) if !metadata.is_dir() => {
             return Err(SyncError::DestinationNotDirectory {
@@ -734,22 +1015,27 @@ fn preflight_destination<'a>(
             });
         }
     }
-
-    let state_path = destination.join(".skill-manager-state.json");
-    if state_path.exists() {
-        return Err(SyncError::ExistingDestinationState {
-            path: display_path(destination),
-        });
-    }
-    for name in destination_names {
-        let path = destination.join(name);
-        if path.exists() {
-            return Err(SyncError::UnmanagedCollision {
-                path: display_path(&path),
-            });
-        }
-    }
     Ok(())
+}
+
+fn ensure_unmanaged_entry_absent(path: &Path) -> Result<(), SyncError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(SyncError::UnmanagedCollision {
+            path: display_path(path),
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(SyncError::DestinationRead {
+            path: display_path(path),
+            source,
+        }),
+    }
+}
+
+fn is_destination_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
+        && name != ".skill-manager-state.json"
 }
 
 fn stage_materialized_skill(
@@ -879,6 +1165,28 @@ fn stage_materialized_skill(
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
+fn stage_materializations(
+    materializations: &[PlannedMaterialization],
+    staged: &Path,
+) -> Result<Vec<MaterializedSkill>, SyncError> {
+    materializations
+        .iter()
+        .map(|materialization| {
+            if cancellation_requested() {
+                return Err(SyncError::Cancelled);
+            }
+            let digest =
+                stage_materialized_skill(materialization, &staged.join(&materialization.name))?;
+            Ok(MaterializedSkill {
+                identity: materialization.identity.clone(),
+                name: materialization.name.clone(),
+                resolved_commit: materialization.resolved_commit.clone(),
+                digest,
+            })
+        })
+        .collect()
+}
+
 fn invalid_materialization_git_output(materialization: &PlannedMaterialization) -> SyncError {
     SyncError::InvalidGitOutput {
         repository: materialization.identity.source.clone(),
@@ -930,16 +1238,20 @@ fn set_executable(_path: &Path, _executable: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn commit_initial_synchronization(
+fn commit_synchronization(
     destination: &Path,
     staged: &Path,
     state: &[u8],
     created: &[MaterializedSkill],
+    updated: &[MaterializedSkill],
+    removed: &[MaterializedSkill],
+    previous_state: Option<&DestinationState>,
+    observed_materialized_skills: &BTreeMap<String, MaterializedSkillContents>,
 ) -> Result<(), SyncError> {
     if cancellation_requested() {
         return Err(SyncError::Cancelled);
     }
-    preflight_destination(destination, created.iter().map(|skill| skill.name.as_str()))?;
+    ensure_destination_directory(destination)?;
 
     let destination_parent = destination
         .parent()
@@ -954,7 +1266,7 @@ fn commit_initial_synchronization(
             path: display_path(destination),
             source,
         })?;
-    for skill in created {
+    for skill in created.iter().chain(updated) {
         copy_directory(
             &staged.join(&skill.name),
             &commit_stage.path().join(&skill.name),
@@ -971,7 +1283,8 @@ fn commit_initial_synchronization(
         }
     })?;
 
-    if !destination.exists() {
+    ensure_destination_directory(destination)?;
+    if !entry_exists(destination)? {
         return fs::rename(commit_stage.path(), destination).map_err(|source| {
             SyncError::DestinationWrite {
                 path: display_path(destination),
@@ -980,30 +1293,185 @@ fn commit_initial_synchronization(
         });
     }
 
-    let mut committed = Vec::new();
-    for skill in created {
-        let target = destination.join(&skill.name);
-        if let Err(source) = fs::rename(commit_stage.path().join(&skill.name), &target) {
-            rollback_created_entries(&committed);
-            return Err(SyncError::DestinationWrite {
-                path: display_path(destination),
-                source,
-            });
-        }
-        committed.push(target);
-    }
-    let state_path = destination.join(".skill-manager-state.json");
-    if let Err(source) = fs::rename(
-        commit_stage.path().join(".skill-manager-state.json"),
-        &state_path,
-    ) {
-        rollback_created_entries(&committed);
-        return Err(SyncError::DestinationWrite {
+    let backup =
+        TempDir::new_in(destination_parent).map_err(|source| SyncError::DestinationWrite {
             path: display_path(destination),
             source,
+        })?;
+    let mut moved_old = Vec::new();
+    let mut installed = Vec::new();
+    let mut old_state_moved = false;
+
+    for skill in created {
+        ensure_unmanaged_entry_absent(&destination.join(&skill.name))?;
+    }
+    let current_state = load_destination_state(destination)?;
+    if current_state.as_ref() != previous_state {
+        return Err(SyncError::DestinationChangedDuringSynchronization {
+            path: display_path(&destination.join(".skill-manager-state.json")),
         });
     }
+    for (name, observed) in observed_materialized_skills {
+        let path = destination.join(name);
+        if materialized_skill_contents(&path)? != *observed {
+            return Err(SyncError::DestinationChangedDuringSynchronization {
+                path: display_path(&path),
+            });
+        }
+    }
+    let old_present = updated.iter().chain(removed).map(|skill| {
+        let observed = observed_materialized_skills
+            .get(&skill.name)
+            .expect("updated and removed Skills were observed before staging");
+        (
+            skill,
+            !matches!(observed, MaterializedSkillContents::Missing),
+        )
+    });
+
+    for (skill, exists) in old_present {
+        let target = destination.join(&skill.name);
+        if exists {
+            if let Err(source) = fs::rename(&target, backup.path().join(&skill.name)) {
+                return Err(commit_failure(
+                    destination,
+                    source,
+                    rollback_reconciliation(
+                        destination,
+                        commit_stage.path(),
+                        backup.path(),
+                        &installed,
+                        &moved_old,
+                        old_state_moved,
+                    ),
+                ));
+            }
+            moved_old.push(skill.name.clone());
+        }
+    }
+    for skill in created.iter().chain(updated) {
+        if let Err(source) = fs::rename(
+            commit_stage.path().join(&skill.name),
+            destination.join(&skill.name),
+        ) {
+            return Err(commit_failure(
+                destination,
+                source,
+                rollback_reconciliation(
+                    destination,
+                    commit_stage.path(),
+                    backup.path(),
+                    &installed,
+                    &moved_old,
+                    old_state_moved,
+                ),
+            ));
+        }
+        installed.push(skill.name.clone());
+    }
+
+    let state_name = ".skill-manager-state.json";
+    let state_path = destination.join(state_name);
+    if previous_state.is_some() {
+        if let Err(source) = fs::rename(&state_path, backup.path().join(state_name)) {
+            return Err(commit_failure(
+                destination,
+                source,
+                rollback_reconciliation(
+                    destination,
+                    commit_stage.path(),
+                    backup.path(),
+                    &installed,
+                    &moved_old,
+                    old_state_moved,
+                ),
+            ));
+        }
+        old_state_moved = true;
+    }
+    if let Err(source) = fs::rename(commit_stage.path().join(state_name), &state_path) {
+        return Err(commit_failure(
+            destination,
+            source,
+            rollback_reconciliation(
+                destination,
+                commit_stage.path(),
+                backup.path(),
+                &installed,
+                &moved_old,
+                old_state_moved,
+            ),
+        ));
+    }
     Ok(())
+}
+
+fn entry_exists(path: &Path) -> Result<bool, SyncError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(SyncError::DestinationRead {
+            path: display_path(path),
+            source,
+        }),
+    }
+}
+
+fn commit_failure(
+    destination: &Path,
+    source: io::Error,
+    rollback: Result<(), io::Error>,
+) -> SyncError {
+    let operation = SyncError::DestinationWrite {
+        path: display_path(destination),
+        source,
+    };
+    match rollback {
+        Ok(()) => operation,
+        Err(rollback) => SyncError::Rollback {
+            operation: Box::new(operation),
+            rollback,
+        },
+    }
+}
+
+fn rollback_reconciliation(
+    destination: &Path,
+    commit_stage: &Path,
+    backup: &Path,
+    installed: &[String],
+    moved_old: &[String],
+    old_state_moved: bool,
+) -> Result<(), io::Error> {
+    let state_name = ".skill-manager-state.json";
+    let mut first_error = None;
+    for name in installed.iter().rev() {
+        record_rollback(
+            fs::rename(destination.join(name), commit_stage.join(name)),
+            &mut first_error,
+        );
+    }
+    for name in moved_old.iter().rev() {
+        record_rollback(
+            fs::rename(backup.join(name), destination.join(name)),
+            &mut first_error,
+        );
+    }
+    if old_state_moved {
+        record_rollback(
+            fs::rename(backup.join(state_name), destination.join(state_name)),
+            &mut first_error,
+        );
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn record_rollback(result: io::Result<()>, first_error: &mut Option<io::Error>) {
+    if let Err(error) = result
+        && first_error.is_none()
+    {
+        *first_error = Some(error);
+    }
 }
 
 fn copy_directory(source: &Path, destination: &Path) -> io::Result<()> {
@@ -1020,12 +1488,6 @@ fn copy_directory(source: &Path, destination: &Path) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-fn rollback_created_entries(paths: &[PathBuf]) {
-    for path in paths.iter().rev() {
-        let _ = fs::remove_dir_all(path);
-    }
 }
 
 pub fn prepare_source_removal(

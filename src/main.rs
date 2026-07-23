@@ -78,7 +78,7 @@ enum Commands {
         /// Synchronization Destination instead of the manifest-relative default.
         #[arg(long, value_name = "DIRECTORY")]
         target: Option<PathBuf>,
-        /// Replace drifted managed Skills when reconciliation supports them.
+        /// Replace or remove drifted managed Skills.
         #[arg(long)]
         force: bool,
         /// Emit the versioned JSON schema.
@@ -330,13 +330,19 @@ fn print_list_human(selections: &SkillSelectionList) {
 fn print_synchronization_human(result: &SynchronizationResult) {
     println!("Manifest: {}", result.manifest_path);
     println!("Synchronization Destination: {}", result.destination);
-    if result.created.is_empty() {
-        println!("Created Materialized Skills: none");
-        return;
-    }
+    print_materialized_skills("Created", &result.created);
+    print_materialized_skills("Updated", &result.updated);
+    print_materialized_skills("Removed", &result.removed);
+    print_materialized_skills("Unchanged", &result.unchanged);
+}
 
-    println!("Created Materialized Skills:");
-    for skill in &result.created {
+fn print_materialized_skills(label: &str, skills: &[skill_manager::MaterializedSkill]) {
+    if skills.is_empty() {
+        println!("{label} Materialized Skills: none");
+    } else {
+        println!("{label} Materialized Skills:");
+    }
+    for skill in skills {
         println!(
             "- {} ({}:{}; commit: {})",
             skill.name, skill.identity.source, skill.identity.path, skill.resolved_commit
