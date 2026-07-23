@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Match tag to package version
+        shell: bash
+        run: |
+          package_version=$(cargo metadata --locked --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "skill-manager") | .version')
+          test "$GITHUB_REF_NAME" = "v$package_version"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: skill-manager
+            format: tar.gz
+            rustflags: ""
+            rustflags_variable: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: skill-manager
+            format: tar.gz
+            rustflags: ""
+            rustflags_variable: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: skill-manager
+            format: tar.gz
+            rustflags: ""
+            rustflags_variable: CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: skill-manager
+            format: tar.gz
+            rustflags: ""
+            rustflags_variable: CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: skill-manager.exe
+            format: zip
+            rustflags: "-C link-arg=/Brepro"
+            rustflags_variable: CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: skill-manager.exe
+            format: zip
+            rustflags: "-C link-arg=/Brepro"
+            rustflags_variable: CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Fix source timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)" >>"$GITHUB_ENV"
+      - name: Configure deterministic linker
+        if: matrix.rustflags != ''
+        shell: bash
+        run: |
+          echo "${{ matrix.rustflags_variable }}=${{ matrix.rustflags }}" \
+            >>"$GITHUB_ENV"
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package release binary
+        id: package
+        shell: bash
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          archive=$(python scripts/package-release.py \
+            --binary "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+            --target "${{ matrix.target }}" \
+            --version "$version" \
+            --format "${{ matrix.format }}" \
+            --output-dir dist)
+          echo "archive=$archive" >>"$GITHUB_OUTPUT"
+      - name: Smoke test archive
+        shell: bash
+        run: |
+          python scripts/release-smoke-test.py \
+            --archive "${{ steps.package.outputs.archive }}" \
+            --binary "${{ matrix.binary }}" \
+            --version "${GITHUB_REF_NAME#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skill-manager-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz *.zip > SHA256SUMS
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; refusing to replace its assets" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag

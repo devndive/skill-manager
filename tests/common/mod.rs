@@ -47,6 +47,7 @@ impl TestRepository {
         git(self.path(), ["rev-parse", "HEAD"])
     }
 
+    #[allow(dead_code)]
     pub fn git(&self, arguments: &[&str]) -> String {
         let output = Command::new("git")
             .args(arguments)
