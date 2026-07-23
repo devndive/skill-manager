@@ -765,9 +765,11 @@ pub fn sync(request: SyncRequest) -> Result<SynchronizationResult, SyncError> {
         &destination,
         staged.path(),
         &state,
-        &created,
-        &updated,
-        &removed,
+        SynchronizationChanges {
+            created: &created,
+            updated: &updated,
+            removed: &removed,
+        },
         previous_state.as_ref(),
         &observed_materialized_skills,
     )?;
@@ -1238,16 +1240,26 @@ fn set_executable(_path: &Path, _executable: bool) -> io::Result<()> {
     Ok(())
 }
 
+struct SynchronizationChanges<'a> {
+    created: &'a [MaterializedSkill],
+    updated: &'a [MaterializedSkill],
+    removed: &'a [MaterializedSkill],
+}
+
 fn commit_synchronization(
     destination: &Path,
     staged: &Path,
     state: &[u8],
-    created: &[MaterializedSkill],
-    updated: &[MaterializedSkill],
-    removed: &[MaterializedSkill],
+    changes: SynchronizationChanges<'_>,
     previous_state: Option<&DestinationState>,
     observed_materialized_skills: &BTreeMap<String, MaterializedSkillContents>,
 ) -> Result<(), SyncError> {
+    let SynchronizationChanges {
+        created,
+        updated,
+        removed,
+    } = changes;
+
     if cancellation_requested() {
         return Err(SyncError::Cancelled);
     }
