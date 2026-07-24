@@ -9,7 +9,9 @@ use tempfile::TempDir;
 
 pub fn git_environment_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub struct TestRepository {
@@ -34,6 +36,11 @@ impl TestRepository {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[allow(dead_code)]
+    pub fn source_repository_path(&self) -> String {
+        self.git(&["rev-parse", "--show-toplevel"])
     }
 
     pub fn write(&self, path: &str, contents: &str) {
@@ -62,7 +69,10 @@ impl TestRepository {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim_end_matches(['\r', '\n'])
+            .to_owned()
     }
 }
 

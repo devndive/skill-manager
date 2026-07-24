@@ -1479,10 +1479,8 @@ fn rollback_reconciliation(
 }
 
 fn record_rollback(result: io::Result<()>, first_error: &mut Option<io::Error>) {
-    if let Err(error) = result
-        && first_error.is_none()
-    {
-        *first_error = Some(error);
+    if first_error.is_none() {
+        *first_error = result.err();
     }
 }
 

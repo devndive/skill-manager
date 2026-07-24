@@ -31,7 +31,7 @@ fn cli_prints_deterministic_human_output() {
         String::from_utf8(output.stdout).unwrap(),
         format!(
             "Source Repository: {}\nRequested revision: HEAD\nResolved commit: {commit}\nSkills:\n- source-repository (.)\n- nested (nested; parent: .)\n",
-            fs::canonicalize(repository.path()).unwrap().display()
+            repository.source_repository_path()
         )
     );
 }
@@ -45,11 +45,7 @@ fn cli_json_follows_the_versioned_schema_for_a_tag() {
     repository.git(&["tag", "v1"]);
     repository.write("future/SKILL.md", "# Future\n");
     repository.commit("add future skill");
-    let source = fs::canonicalize(repository.path())
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_owned();
+    let source = repository.source_repository_path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
         .args([
@@ -309,7 +305,7 @@ fn cli_selects_all_skills_into_the_default_manifest() {
         String::from_utf8(output.stdout).unwrap(),
         format!(
             "Manifest: skills.toml\nSource Repository: {}\nRequested revision: HEAD\nResolved commit: {commit}\nSkill Selection:\n- alpha (alpha)\n- beta (beta)\n",
-            fs::canonicalize(repository.path()).unwrap().display()
+            repository.source_repository_path()
         )
     );
     assert!(working_directory.path().join("skills.toml").is_file());
@@ -325,11 +321,7 @@ fn cli_selects_repeated_exact_paths_into_a_custom_manifest_as_json() {
     repository.git(&["tag", "v1"]);
     let manifest_directory = TempDir::new().unwrap();
     let manifest_path = manifest_directory.path().join("selected.toml");
-    let source = fs::canonicalize(repository.path())
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_owned();
+    let source = repository.source_repository_path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
         .args([

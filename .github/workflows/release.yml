@@ -84,7 +84,7 @@ jobs:
           echo "${{ matrix.rustflags_variable }}=${{ matrix.rustflags }}" \
             >>"$GITHUB_ENV"
       - name: Build release binary
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --package skill-manager --target ${{ matrix.target }}
       - name: Package release binary
         id: package
         shell: bash

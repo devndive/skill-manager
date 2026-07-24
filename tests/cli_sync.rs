@@ -39,7 +39,7 @@ fn cli_sync_uses_the_manifest_relative_default_destination() {
             "Manifest: {}\nSynchronization Destination: {}\nCreated Materialized Skills:\n- alpha ({}:alpha; commit: {commit})\nUpdated Materialized Skills: none\nRemoved Materialized Skills: none\nUnchanged Materialized Skills: none\n",
             manifest_path.display(),
             destination.display(),
-            fs::canonicalize(repository.path()).unwrap().display(),
+            repository.source_repository_path(),
         )
     );
     assert!(destination.join("alpha/SKILL.md").is_file());
@@ -60,10 +60,7 @@ fn cli_sync_accepts_an_explicit_target_and_emits_versioned_json() {
     )
     .unwrap();
     let target = manifest_directory.path().join("custom");
-    let source = fs::canonicalize(repository.path())
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
+    let source = repository.source_repository_path();
 
     let output = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
         .args([

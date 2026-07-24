@@ -43,13 +43,7 @@ fn library_discovers_nested_skills_with_duplicate_names_at_a_commit() {
 
     assert_eq!(discovery.schema_version, 1);
     assert_eq!(discovery.source.repository_type, "local");
-    assert_eq!(
-        discovery.source.path,
-        fs::canonicalize(repository.path())
-            .unwrap()
-            .to_str()
-            .unwrap()
-    );
+    assert_eq!(discovery.source.path, repository.source_repository_path());
     assert_eq!(discovery.requested_revision, historical_commit);
     assert_eq!(
         discovery
@@ -203,13 +197,7 @@ fn library_preserves_trailing_whitespace_in_the_repository_path() {
 
     let discovery = discover(DiscoverRequest::new(repository.path())).unwrap();
 
-    assert_eq!(
-        discovery.source.path,
-        fs::canonicalize(repository.path())
-            .unwrap()
-            .to_str()
-            .unwrap()
-    );
+    assert_eq!(discovery.source.path, repository.source_repository_path());
     assert_eq!(discovery.skills[0].name, "source-repository ");
 }
 

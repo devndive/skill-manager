@@ -32,6 +32,26 @@ cargo install --path . --locked
 
 The crate is not published to crates.io.
 
+## Development
+
+The repository pins the CI toolchain and checks compatibility with Rust 1.85.
+Install the MSRV toolchain and enable the repository-managed Git hooks once:
+
+```console
+rustup toolchain install 1.85.0 --profile minimal
+cargo xtask install-hooks
+```
+
+Run the same checks manually with:
+
+```console
+cargo xtask ci
+```
+
+The pre-commit hook runs this command automatically. It checks formatting,
+Rust 1.85 compatibility, Clippy on the host and Windows targets, the complete
+test suite, and the release build.
+
 ## Discover Skills
 
 Discover tracked Skills from a local Source Repository:

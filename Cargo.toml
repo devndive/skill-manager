@@ -23,3 +23,7 @@ dialoguer = { version = "0.11", default-features = false }
 libc = "0.2"
 
 [dev-dependencies]
+
+[workspace]
+members = ["xtask"]
+resolver = "3"

@@ -78,7 +78,7 @@ fn library_materializes_selected_local_skills_at_the_recorded_commit() {
             {
                 "name": "nested",
                 "identity": {
-                    "source": fs::canonicalize(repository.path()).unwrap(),
+                    "source": repository.source_repository_path(),
                     "path": "parent/nested",
                 },
                 "resolved_commit": recorded_commit,
@@ -87,7 +87,7 @@ fn library_materializes_selected_local_skills_at_the_recorded_commit() {
             {
                 "name": "parent",
                 "identity": {
-                    "source": fs::canonicalize(repository.path()).unwrap(),
+                    "source": repository.source_repository_path(),
                     "path": "parent",
                 },
                 "resolved_commit": result.created[1].resolved_commit,
@@ -679,7 +679,7 @@ fn library_force_does_not_accept_invalid_state_as_managed_ownership() {
             "owner": "skill-manager",
             "managed_skills": [{
                 "identity": {
-                    "source": fs::canonicalize(repository.path()).unwrap(),
+                    "source": repository.source_repository_path(),
                     "path": "alpha",
                 },
                 "name": "alpha",
