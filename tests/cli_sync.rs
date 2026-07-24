@@ -1,7 +1,11 @@
 use std::fs;
 use std::process::Command;
+#[cfg(unix)]
+use std::{path::Path, process::Output};
 
 use serde_json::json;
+#[cfg(unix)]
+use skill_manager::SyncError;
 use skill_manager::{SelectRequest, SyncRequest, select, sync};
 use tempfile::TempDir;
 
@@ -418,5 +422,798 @@ fn cli_sync_source_failure_leaves_the_complete_reconciliation_unchanged() {
     assert_eq!(
         fs::read(destination.join(".skill-manager-state.json")).unwrap(),
         original_state
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_recovers_an_interruption_after_old_entries_are_backed_up() {
+    let _lock = git_environment_lock();
+    assert_interrupted_sync_recovers("after-old-entries", Some("after-new-entries"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_recovers_interruptions_at_every_other_commit_phase() {
+    let _lock = git_environment_lock();
+    for point in [
+        "after-journal",
+        "after-new-entries",
+        "after-old-state",
+        "after-new-state",
+    ] {
+        assert_interrupted_sync_recovers(point, None);
+    }
+}
+
+#[cfg(unix)]
+fn assert_interrupted_sync_recovers(point: &str, recovery_interrupt: Option<&str>) {
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.write("removed/SKILL.md", "# Removed\n");
+    repository.commit("add initial skills");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    fs::create_dir(destination.join("unmanaged")).unwrap();
+    fs::write(destination.join("unmanaged/keep.txt"), "keep\n").unwrap();
+
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.write("created/SKILL.md", "# Created\n");
+    repository.commit("change skills");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_path("alpha")
+            .select_path("created"),
+    )
+    .unwrap();
+
+    interrupt_sync(&manifest_path, &destination, point, false);
+    assert!(
+        destination
+            .join(".skill-manager-transaction/journal.json")
+            .is_file()
+    );
+
+    let journal: serde_json::Value = serde_json::from_slice(
+        &fs::read(destination.join(".skill-manager-transaction/journal.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(journal["journal_version"], 1);
+    assert_eq!(journal["phase"], "committing");
+    assert_eq!(journal["next_state_path"], "next-state.json");
+    assert_eq!(journal["operations"].as_array().unwrap().len(), 3);
+
+    if let Some(recovery_interrupt) = recovery_interrupt {
+        interrupt_sync(&manifest_path, &destination, recovery_interrupt, false);
+        assert!(
+            destination
+                .join(".skill-manager-transaction/journal.json")
+                .is_file()
+        );
+    }
+
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(destination.join("alpha/SKILL.md")).unwrap(),
+        "# Alpha v2\n"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("created/SKILL.md")).unwrap(),
+        "# Created\n"
+    );
+    assert!(!destination.join("removed").exists());
+    assert_eq!(
+        fs::read_to_string(destination.join("unmanaged/keep.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(!destination.join(".skill-manager-transaction").exists());
+}
+
+#[cfg(unix)]
+fn interrupt_sync(manifest_path: &Path, destination: &Path, point: &str, force: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_skill-manager"));
+    command.args([
+        "sync",
+        "--manifest",
+        manifest_path.to_str().unwrap(),
+        "--target",
+        destination.to_str().unwrap(),
+    ]);
+    if force {
+        command.arg("--force");
+    }
+    let output = command
+        .env("SKILL_MANAGER_TEST_SYNC_INTERRUPT_AT", point)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    output
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_cancellation_during_staging_leaves_no_destination_or_temporary_changes() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.write("beta/SKILL.md", "# Beta v1\n");
+    repository.commit("add initial skills");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    let original_state = fs::read(destination.join(".skill-manager-state.json")).unwrap();
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.write("beta/SKILL.md", "# Beta v2\n");
+    repository.commit("update skills");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let temporary_root = TempDir::new().unwrap();
+
+    let cancelled = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
+        .args([
+            "sync",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--target",
+            destination.to_str().unwrap(),
+        ])
+        .env("TMPDIR", temporary_root.path())
+        .env("SKILL_MANAGER_TEST_SYNC_CANCEL_AT", "during-staging")
+        .output()
+        .unwrap();
+
+    assert!(!cancelled.status.success());
+    assert!(
+        String::from_utf8(cancelled.stderr)
+            .unwrap()
+            .contains("Skill Synchronization was cancelled")
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("alpha/SKILL.md")).unwrap(),
+        "# Alpha v1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("beta/SKILL.md")).unwrap(),
+        "# Beta v1\n"
+    );
+    assert_eq!(
+        fs::read(destination.join(".skill-manager-state.json")).unwrap(),
+        original_state
+    );
+    assert!(!destination.join(".skill-manager-transaction").exists());
+    assert_eq!(fs::read_dir(temporary_root.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_recovers_an_interrupted_first_materialization() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha\n");
+    repository.commit("add skill");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+
+    interrupt_sync(&manifest_path, &destination, "after-journal", false);
+    assert!(
+        destination
+            .join(".skill-manager-transaction/journal.json")
+            .is_file()
+    );
+    assert!(!destination.join("alpha").exists());
+
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(destination.join("alpha/SKILL.md")).unwrap(),
+        "# Alpha\n"
+    );
+    assert!(destination.join(".skill-manager-state.json").is_file());
+    assert!(!destination.join(".skill-manager-transaction").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_cancellation_during_commit_restores_the_previous_state() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.write("removed/SKILL.md", "# Removed\n");
+    repository.commit("add initial skills");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    fs::write(destination.join("keep.txt"), "unmanaged\n").unwrap();
+    let original_state = fs::read(destination.join(".skill-manager-state.json")).unwrap();
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.write("created/SKILL.md", "# Created\n");
+    repository.commit("change skills");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_path("alpha")
+            .select_path("created"),
+    )
+    .unwrap();
+
+    let cancelled = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
+        .args([
+            "sync",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--target",
+            destination.to_str().unwrap(),
+        ])
+        .env("SKILL_MANAGER_TEST_SYNC_CANCEL_AT", "after-old-entries")
+        .output()
+        .unwrap();
+
+    assert!(!cancelled.status.success());
+    assert!(
+        String::from_utf8(cancelled.stderr)
+            .unwrap()
+            .contains("Skill Synchronization was cancelled")
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("alpha/SKILL.md")).unwrap(),
+        "# Alpha v1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("removed/SKILL.md")).unwrap(),
+        "# Removed\n"
+    );
+    assert!(!destination.join("created").exists());
+    assert_eq!(
+        fs::read_to_string(destination.join("keep.txt")).unwrap(),
+        "unmanaged\n"
+    );
+    assert_eq!(
+        fs::read(destination.join(".skill-manager-state.json")).unwrap(),
+        original_state
+    );
+    assert!(!destination.join(".skill-manager-transaction").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_cancellation_after_recreating_a_missing_skill_restores_the_missing_state() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.commit("add skill");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    let original_state = fs::read(destination.join(".skill-manager-state.json")).unwrap();
+    fs::remove_dir_all(destination.join("alpha")).unwrap();
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.commit("update skill");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+
+    let cancelled = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
+        .args([
+            "sync",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--target",
+            destination.to_str().unwrap(),
+        ])
+        .env("SKILL_MANAGER_TEST_SYNC_CANCEL_AT", "after-new-entries")
+        .output()
+        .unwrap();
+
+    assert!(!cancelled.status.success());
+    assert!(!destination.join("alpha").exists());
+    assert_eq!(
+        fs::read(destination.join(".skill-manager-state.json")).unwrap(),
+        original_state
+    );
+    assert!(!destination.join(".skill-manager-transaction").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_recovery_preserves_drift_created_after_interruption() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.commit("add skill");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    fs::write(destination.join("keep.txt"), "unmanaged\n").unwrap();
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.commit("update skill");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    interrupt_sync(&manifest_path, &destination, "after-journal", false);
+    fs::write(destination.join("alpha/SKILL.md"), "# Local edit\n").unwrap();
+
+    let error = sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap_err();
+
+    assert!(matches!(
+        error,
+        SyncError::DestinationChangedDuringSynchronization { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(destination.join("alpha/SKILL.md")).unwrap(),
+        "# Local edit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("keep.txt")).unwrap(),
+        "unmanaged\n"
+    );
+    assert!(
+        destination
+            .join(".skill-manager-transaction/journal.json")
+            .is_file()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_recovery_preflights_all_entries_before_mutation() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.write("zeta/SKILL.md", "# Zeta v1\n");
+    repository.commit("add skills");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    let original_state = fs::read(destination.join(".skill-manager-state.json")).unwrap();
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.write("zeta/SKILL.md", "# Zeta v2\n");
+    repository.commit("update skills");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    interrupt_sync(&manifest_path, &destination, "after-journal", false);
+    fs::write(destination.join("zeta/SKILL.md"), "# Local zeta\n").unwrap();
+
+    let error = sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap_err();
+
+    assert!(matches!(
+        error,
+        SyncError::DestinationChangedDuringSynchronization { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(destination.join("alpha/SKILL.md")).unwrap(),
+        "# Alpha v1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("zeta/SKILL.md")).unwrap(),
+        "# Local zeta\n"
+    );
+    assert_eq!(
+        fs::read(destination.join(".skill-manager-state.json")).unwrap(),
+        original_state
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_recovery_preserves_changed_unsupported_drift_from_a_forced_transaction() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.commit("add skill");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    fs::remove_dir_all(destination.join("alpha")).unwrap();
+    fs::write(destination.join("alpha"), "first unsupported contents\n").unwrap();
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.commit("update skill");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+
+    interrupt_sync(&manifest_path, &destination, "after-journal", true);
+    fs::write(destination.join("alpha"), "changed after interruption\n").unwrap();
+
+    let error = sync(
+        SyncRequest::new(&manifest_path)
+            .with_destination(&destination)
+            .with_force(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        SyncError::DestinationChangedDuringSynchronization { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(destination.join("alpha")).unwrap(),
+        "changed after interruption\n"
+    );
+    assert!(
+        destination
+            .join(".skill-manager-transaction/journal.json")
+            .is_file()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_recovery_rejects_a_next_state_inconsistent_with_the_journal() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.commit("add skill");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    fs::write(destination.join("keep.txt"), "unmanaged\n").unwrap();
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.commit("update skill");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    interrupt_sync(&manifest_path, &destination, "after-journal", false);
+    let next_state_path = destination.join(".skill-manager-transaction/next-state.json");
+    let mut next_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&next_state_path).unwrap()).unwrap();
+    let mut unrelated = next_state["managed_skills"][0].clone();
+    unrelated["name"] = json!("unrelated");
+    next_state["managed_skills"]
+        .as_array_mut()
+        .unwrap()
+        .push(unrelated);
+    fs::write(
+        &next_state_path,
+        serde_json::to_vec_pretty(&next_state).unwrap(),
+    )
+    .unwrap();
+
+    let error = sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap_err();
+
+    assert!(matches!(error, SyncError::InvalidTransactionJournal { .. }));
+    assert_eq!(
+        fs::read_to_string(destination.join("alpha/SKILL.md")).unwrap(),
+        "# Alpha v1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("keep.txt")).unwrap(),
+        "unmanaged\n"
+    );
+    assert!(
+        destination
+            .join(".skill-manager-transaction/journal.json")
+            .is_file()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_rolling_back_rejects_a_corrupt_late_backup_before_restoring_any_entry() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.write("zeta/SKILL.md", "# Zeta v1\n");
+    repository.commit("add skills");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.write("zeta/SKILL.md", "# Zeta v2\n");
+    repository.commit("update skills");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    interrupt_sync(&manifest_path, &destination, "after-old-entries", false);
+    let journal_path = destination.join(".skill-manager-transaction/journal.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    journal["phase"] = json!("rolling_back");
+    fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+    fs::write(
+        destination.join(".skill-manager-transaction/backup/alpha/SKILL.md"),
+        "# Corrupt alpha\n",
+    )
+    .unwrap();
+
+    let error = sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap_err();
+
+    assert!(matches!(error, SyncError::InvalidTransactionJournal { .. }));
+    assert!(!destination.join("alpha").exists());
+    assert!(!destination.join("zeta").exists());
+    assert!(
+        destination
+            .join(".skill-manager-transaction/backup/zeta/SKILL.md")
+            .is_file()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_rejects_a_malformed_preparing_transaction_without_cleanup() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.commit("add skill");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.commit("update skill");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    interrupt_sync(&manifest_path, &destination, "after-journal", false);
+    let journal_path = destination.join(".skill-manager-transaction/journal.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    journal["phase"] = json!("preparing");
+    fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+    fs::remove_file(destination.join(".skill-manager-transaction/next-state.json")).unwrap();
+
+    let error = sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap_err();
+
+    assert!(matches!(error, SyncError::InvalidTransactionJournal { .. }));
+    assert_eq!(
+        fs::read_to_string(destination.join("alpha/SKILL.md")).unwrap(),
+        "# Alpha v1\n"
+    );
+    assert!(journal_path.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_rejects_a_preparing_phase_that_already_contains_backups() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.commit("add skill");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.commit("update skill");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    interrupt_sync(&manifest_path, &destination, "after-old-entries", false);
+    let journal_path = destination.join(".skill-manager-transaction/journal.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+    journal["phase"] = json!("preparing");
+    fs::write(&journal_path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+
+    let error = sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap_err();
+
+    assert!(matches!(error, SyncError::InvalidTransactionJournal { .. }));
+    assert!(!destination.join("alpha").exists());
+    assert!(
+        destination
+            .join(".skill-manager-transaction/backup/alpha/SKILL.md")
+            .is_file()
+    );
+    assert!(journal_path.is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_recovers_an_interruption_while_discarding_rollback_content() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.commit("add skill");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.commit("update skill");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+
+    let interrupted = Command::new(env!("CARGO_BIN_EXE_skill-manager"))
+        .args([
+            "sync",
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--target",
+            destination.to_str().unwrap(),
+        ])
+        .env("SKILL_MANAGER_TEST_SYNC_CANCEL_AT", "after-new-entries")
+        .env(
+            "SKILL_MANAGER_TEST_SYNC_INTERRUPT_AT",
+            "after-rollback-discard",
+        )
+        .output()
+        .unwrap();
+
+    assert!(!interrupted.status.success());
+    assert!(!destination.join("alpha").exists());
+    assert!(
+        destination
+            .join(".skill-manager-transaction/discarded/alpha/SKILL.md")
+            .is_file()
+    );
+    fs::remove_dir_all(repository.path()).unwrap();
+
+    let error = sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap_err();
+
+    assert!(matches!(error, SyncError::CommitUnavailable { .. }));
+    assert_eq!(
+        fs::read_to_string(destination.join("alpha/SKILL.md")).unwrap(),
+        "# Alpha v1\n"
+    );
+    assert!(!destination.join(".skill-manager-transaction").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_sync_rejects_symlinked_transaction_directories_without_external_mutation() {
+    use std::os::unix::fs::symlink;
+
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha v1\n");
+    repository.commit("add skill");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    repository.write("alpha/SKILL.md", "# Alpha v2\n");
+    repository.commit("update skill");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    interrupt_sync(&manifest_path, &destination, "after-journal", false);
+    let external = TempDir::new().unwrap();
+    fs::write(external.path().join("keep.txt"), "external\n").unwrap();
+    let backup = destination.join(".skill-manager-transaction/backup");
+    fs::remove_dir(&backup).unwrap();
+    symlink(external.path(), &backup).unwrap();
+
+    let error = sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap_err();
+
+    assert!(matches!(error, SyncError::InvalidTransactionJournal { .. }));
+    assert_eq!(
+        fs::read_to_string(destination.join("alpha/SKILL.md")).unwrap(),
+        "# Alpha v1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(external.path().join("keep.txt")).unwrap(),
+        "external\n"
     );
 }

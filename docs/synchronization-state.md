@@ -58,3 +58,44 @@ Digest mismatches are Materialized Skill Drift. Without `--force`, any drifted
 managed entry stops the complete reconciliation before mutation. With
 `--force`, only entries already listed in `managed_skills` may be replaced or
 removed. Destination entries absent from state remain unmanaged and protected.
+
+## Interrupted synchronization recovery
+
+Synchronization stages all Source Repository content before publishing
+transaction metadata. Immediately before the first Synchronization Destination
+mutation, Skill Manager atomically publishes
+`.skill-manager-transaction/journal.json` together with durable staged content
+and the intended next destination state.
+
+Journal version 1 records:
+
+- `journal_version`: the integer `1`.
+- `owner`: the string `skill-manager`.
+- `phase`: `preparing`, `committing`, or `rolling_back`.
+- whether the Synchronization Destination existed before the transaction.
+- every create, update, and removal operation, including its destination,
+  staged content, backup location, prior observed content, and intended digest.
+- the backup location for the previous destination state, when present, and
+  the staged next destination state.
+
+The transaction directory is temporary Skill Manager-owned data. It is removed
+only after the selected Materialized Skills and
+`.skill-manager-state.json` are durable.
+
+Every `sync` checks for an incomplete transaction before reading the manifest
+or planning new work:
+
+- `preparing` has not changed managed destination content and is discarded.
+- `committing` is completed from the recorded durable staged content.
+- `rolling_back` restores the recorded backups.
+
+Recovery is idempotent. If recovery is interrupted, the next `sync` repeats the
+same recorded phase. Partially committed Materialized Skills remain owned by
+the transaction and are not treated as unmanaged collisions. Entries not named
+by the journal are never changed.
+
+If destination content changed after interruption and no longer matches either
+the recorded prior or intended content, recovery stops without overwriting it.
+Malformed journals, unsafe paths, missing required artifacts, and unsupported
+journal versions also stop synchronization without destination mutation. The
+journal remains in place for diagnosis and manual repair.

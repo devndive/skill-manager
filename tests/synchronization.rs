@@ -705,6 +705,103 @@ fn library_force_does_not_accept_invalid_state_as_managed_ownership() {
     );
 }
 
+#[test]
+fn library_rejects_a_malformed_transaction_journal_without_destination_changes() {
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    fs::write(&manifest_path, "manifest_version = 1\nsources = []\n").unwrap();
+    let destination = manifest_directory.path().join("skills");
+    fs::create_dir_all(destination.join(".skill-manager-transaction")).unwrap();
+    fs::write(destination.join("keep.txt"), "unmanaged\n").unwrap();
+    fs::write(
+        destination.join(".skill-manager-transaction/journal.json"),
+        b"not json",
+    )
+    .unwrap();
+
+    let error = sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap_err();
+
+    assert!(matches!(error, SyncError::InvalidTransactionJournal { .. }));
+    assert_eq!(
+        fs::read_to_string(destination.join("keep.txt")).unwrap(),
+        "unmanaged\n"
+    );
+    assert_eq!(
+        fs::read(destination.join(".skill-manager-transaction/journal.json")).unwrap(),
+        b"not json"
+    );
+}
+
+#[test]
+fn library_rejects_an_unsupported_transaction_journal_version_without_destination_changes() {
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    fs::write(&manifest_path, "manifest_version = 1\nsources = []\n").unwrap();
+    let destination = manifest_directory.path().join("skills");
+    fs::create_dir_all(destination.join(".skill-manager-transaction")).unwrap();
+    fs::write(destination.join("keep.txt"), "unmanaged\n").unwrap();
+    fs::write(
+        destination.join(".skill-manager-transaction/journal.json"),
+        serde_json::to_vec_pretty(&json!({
+            "journal_version": 2,
+            "owner": "skill-manager",
+            "phase": "preparing",
+            "destination_existed": true,
+            "operations": [],
+            "previous_state_path": null,
+            "backup_state_path": null,
+            "next_state_path": "next-state.json",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap_err();
+
+    assert!(matches!(error, SyncError::InvalidTransactionJournal { .. }));
+    assert_eq!(
+        fs::read_to_string(destination.join("keep.txt")).unwrap(),
+        "unmanaged\n"
+    );
+    assert!(
+        destination
+            .join(".skill-manager-transaction/journal.json")
+            .is_file()
+    );
+}
+
+#[test]
+fn library_preserves_an_unmanaged_entry_named_like_transaction_cleanup_data() {
+    let _lock = git_environment_lock();
+    let repository = TestRepository::new("source-repository");
+    repository.write("alpha/SKILL.md", "# Alpha\n");
+    repository.commit("add skill");
+    let manifest_directory = TempDir::new().unwrap();
+    let manifest_path = manifest_directory.path().join("skills.toml");
+    select(
+        SelectRequest::new(repository.path())
+            .with_manifest_path(&manifest_path)
+            .select_all(),
+    )
+    .unwrap();
+    let destination = manifest_directory.path().join("skills");
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+    fs::create_dir_all(destination.join(".skill-manager-transaction-cleanup")).unwrap();
+    fs::write(
+        destination.join(".skill-manager-transaction-cleanup/keep.txt"),
+        "unmanaged\n",
+    )
+    .unwrap();
+
+    sync(SyncRequest::new(&manifest_path).with_destination(&destination)).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(destination.join(".skill-manager-transaction-cleanup/keep.txt"))
+            .unwrap(),
+        "unmanaged\n"
+    );
+}
+
 fn assert_content_drift(mutate: impl FnOnce(&std::path::Path)) {
     let _lock = git_environment_lock();
     let repository = TestRepository::new("source-repository");

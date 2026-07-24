@@ -169,6 +169,13 @@ Successful synchronization writes
 Skill Identity, resolved commits, and deterministic content digests. Add
 `--json` for the versioned machine-readable result.
 
+Synchronization also uses a versioned `.skill-manager-transaction` journal
+inside the destination while committing changes. If cancellation or process
+termination interrupts a commit, the next `sync` recovers that transaction
+before planning new work. Recovery can itself be repeated safely, preserves
+unrelated destination entries, and fails without mutation when the journal is
+malformed or has an unsupported version.
+
 ## Contracts and errors
 
 - [`skills.toml` schema](docs/skills-toml.md)

@@ -14,11 +14,36 @@ use thiserror::Error;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Formatted, Item, Table, Value, value};
 
 static CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+const DESTINATION_STATE_FILE: &str = ".skill-manager-state.json";
+const TRANSACTION_DIRECTORY: &str = ".skill-manager-transaction";
+const TRANSACTION_JOURNAL_FILE: &str = "journal.json";
 
 #[derive(Debug, Clone)]
 pub struct DiscoverRequest {
     source: DiscoverSource,
     revision: Option<String>,
+}
+
+fn require_directory(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(format!("'{}' is not a directory", display_path(path))),
+        Err(error) => Err(format!(
+            "could not inspect '{}': {error}",
+            display_path(path)
+        )),
+    }
+}
+
+fn require_regular_file(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(format!("'{}' is not a regular file", display_path(path))),
+        Err(error) => Err(format!(
+            "could not inspect '{}': {error}",
+            display_path(path)
+        )),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +301,89 @@ struct DestinationState {
     managed_skills: Vec<MaterializedSkill>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TransactionJournal {
+    journal_version: u32,
+    owner: String,
+    phase: TransactionPhase,
+    destination_existed: bool,
+    operations: Vec<TransactionOperation>,
+    previous_state_path: Option<String>,
+    backup_state_path: Option<String>,
+    next_state_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransactionPhase {
+    Preparing,
+    Committing,
+    RollingBack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncTestPoint {
+    DuringStaging,
+    AfterJournal,
+    AfterOldEntries,
+    AfterNewEntries,
+    AfterOldState,
+    AfterNewState,
+    AfterRollbackDiscard,
+}
+
+#[cfg(debug_assertions)]
+impl SyncTestPoint {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DuringStaging => "during-staging",
+            Self::AfterJournal => "after-journal",
+            Self::AfterOldEntries => "after-old-entries",
+            Self::AfterNewEntries => "after-new-entries",
+            Self::AfterOldState => "after-old-state",
+            Self::AfterNewState => "after-new-state",
+            Self::AfterRollbackDiscard => "after-rollback-discard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TransactionOperation {
+    name: String,
+    kind: TransactionOperationKind,
+    destination_path: String,
+    staged_path: Option<String>,
+    backup_path: Option<String>,
+    previous: TransactionEntryState,
+    next_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransactionOperationKind {
+    Create,
+    Update,
+    Remove,
+}
+
+impl TransactionOperationKind {
+    fn has_staged_content(self) -> bool {
+        self != Self::Remove
+    }
+
+    fn has_backup(self) -> bool {
+        self != Self::Create
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "digest")]
+enum TransactionEntryState {
+    Missing,
+    Digest(String),
+    Unsupported(String),
+}
+
 #[derive(Debug, Error)]
 pub enum SyncError {
     #[error(transparent)]
@@ -301,6 +409,8 @@ pub enum SyncError {
     DestinationNotDirectory { path: String },
     #[error("Synchronization Destination state '{path}' is invalid: {details}")]
     InvalidDestinationState { path: String, details: String },
+    #[error("Synchronization transaction journal '{path}' is invalid: {details}")]
+    InvalidTransactionJournal { path: String, details: String },
     #[error(
         "Materialized Skill '{skill}' has drift at '{path}'; rerun with --force to replace or remove this managed content"
     )]
@@ -639,7 +749,6 @@ pub fn sync(request: SyncRequest) -> Result<SynchronizationResult, SyncError> {
     }
 
     let manifest_path = request.manifest_path;
-    let selections = list_selections(&manifest_path)?;
     let destination = request.destination.unwrap_or_else(|| {
         manifest_path
             .parent()
@@ -648,6 +757,10 @@ pub fn sync(request: SyncRequest) -> Result<SynchronizationResult, SyncError> {
             .join(".agents/skills")
     });
     let force = request.force;
+
+    ensure_destination_directory(&destination)?;
+    recover_transaction(&destination)?;
+    let selections = list_selections(&manifest_path)?;
 
     let mut planned = Vec::new();
     let mut destination_names = BTreeMap::<String, SkillIdentity>::new();
@@ -679,7 +792,6 @@ pub fn sync(request: SyncRequest) -> Result<SynchronizationResult, SyncError> {
     }
     planned.sort_by(|left, right| left.name.cmp(&right.name));
 
-    ensure_destination_directory(&destination)?;
     let previous_state = load_destination_state(&destination)?;
     let mut recorded = previous_state
         .as_ref()
@@ -785,6 +897,70 @@ pub fn sync(request: SyncRequest) -> Result<SynchronizationResult, SyncError> {
     })
 }
 
+fn recover_transaction(destination: &Path) -> Result<(), SyncError> {
+    let Some(journal) = load_transaction_journal(destination)? else {
+        return Ok(());
+    };
+    validate_transaction_journal(destination, &journal)?;
+    match journal.phase {
+        TransactionPhase::Preparing => {
+            let (previous_state, _) =
+                validate_transaction_artifacts_for_commit(destination, &journal)?;
+            validate_preparing_destination(destination, &journal, previous_state.as_ref())?;
+            cleanup_transaction(destination, &journal)
+        }
+        TransactionPhase::Committing => {
+            complete_transaction_commit(destination, &journal)?;
+            cleanup_transaction(destination, &journal)
+        }
+        TransactionPhase::RollingBack => {
+            rollback_transaction(destination, &journal)?;
+            cleanup_transaction(destination, &journal)
+        }
+    }
+}
+
+fn load_transaction_journal(destination: &Path) -> Result<Option<TransactionJournal>, SyncError> {
+    let transaction_path = destination.join(TRANSACTION_DIRECTORY);
+    let journal_path = transaction_path.join(TRANSACTION_JOURNAL_FILE);
+    match fs::symlink_metadata(&transaction_path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(invalid_transaction_journal(
+                &journal_path,
+                "transaction path is not a directory",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(SyncError::DestinationRead {
+                path: display_path(&transaction_path),
+                source,
+            });
+        }
+    }
+    require_regular_file(&journal_path)
+        .map_err(|details| invalid_transaction_journal(&journal_path, details))?;
+    let contents =
+        fs::read(&journal_path).map_err(|source| SyncError::InvalidTransactionJournal {
+            path: display_path(&journal_path),
+            details: source.to_string(),
+        })?;
+    let journal: TransactionJournal = serde_json::from_slice(&contents).map_err(|error| {
+        SyncError::InvalidTransactionJournal {
+            path: display_path(&journal_path),
+            details: error.to_string(),
+        }
+    })?;
+    if journal.journal_version != 1 || journal.owner != "skill-manager" {
+        return Err(SyncError::InvalidTransactionJournal {
+            path: display_path(&journal_path),
+            details: "expected journal_version 1 owned by 'skill-manager'".to_owned(),
+        });
+    }
+    Ok(Some(journal))
+}
+
 struct PlannedMaterialization {
     source_path: PathBuf,
     identity: SkillIdentity,
@@ -797,7 +973,7 @@ struct PlannedMaterialization {
 enum MaterializedSkillContents {
     Missing,
     Digest(String),
-    UnsupportedEntry(String),
+    UnsupportedEntry { path: String, fingerprint: String },
 }
 
 impl MaterializedSkillContents {
@@ -826,7 +1002,7 @@ fn inspect_materialized_skill(
 }
 
 fn load_destination_state(destination: &Path) -> Result<Option<DestinationState>, SyncError> {
-    let state_path = destination.join(".skill-manager-state.json");
+    let state_path = destination.join(DESTINATION_STATE_FILE);
     let contents = match fs::read(&state_path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -837,14 +1013,21 @@ fn load_destination_state(destination: &Path) -> Result<Option<DestinationState>
             });
         }
     };
+    parse_destination_state(&contents, &state_path).map(Some)
+}
+
+fn parse_destination_state(
+    contents: &[u8],
+    state_path: &Path,
+) -> Result<DestinationState, SyncError> {
     let state: DestinationState =
-        serde_json::from_slice(&contents).map_err(|error| SyncError::InvalidDestinationState {
-            path: display_path(&state_path),
+        serde_json::from_slice(contents).map_err(|error| SyncError::InvalidDestinationState {
+            path: display_path(state_path),
             details: error.to_string(),
         })?;
     if state.state_version != 1 || state.owner != "skill-manager" {
         return Err(SyncError::InvalidDestinationState {
-            path: display_path(&state_path),
+            path: display_path(state_path),
             details: "expected state_version 1 owned by 'skill-manager'".to_owned(),
         });
     }
@@ -852,7 +1035,7 @@ fn load_destination_state(destination: &Path) -> Result<Option<DestinationState>
     for skill in &state.managed_skills {
         if !is_destination_name(&skill.name) {
             return Err(SyncError::InvalidDestinationState {
-                path: display_path(&state_path),
+                path: display_path(state_path),
                 details: format!(
                     "managed Skill name '{}' is not a safe top-level entry",
                     skill.name
@@ -861,13 +1044,13 @@ fn load_destination_state(destination: &Path) -> Result<Option<DestinationState>
         }
         if !names.insert(skill.name.as_str()) {
             return Err(SyncError::InvalidDestinationState {
-                path: display_path(&state_path),
+                path: display_path(state_path),
                 details: "managed Skill names must be unique".to_owned(),
             });
         }
         if !is_hex_identifier(&skill.resolved_commit, &[40, 64]) {
             return Err(SyncError::InvalidDestinationState {
-                path: display_path(&state_path),
+                path: display_path(state_path),
                 details: format!(
                     "managed Skill '{}' has an invalid resolved commit",
                     skill.name
@@ -877,12 +1060,12 @@ fn load_destination_state(destination: &Path) -> Result<Option<DestinationState>
         let digest = skill.digest.strip_prefix("sha256:").unwrap_or_default();
         if !is_hex_identifier(digest, &[64]) {
             return Err(SyncError::InvalidDestinationState {
-                path: display_path(&state_path),
+                path: display_path(state_path),
                 details: format!("managed Skill '{}' has an invalid digest", skill.name),
             });
         }
     }
-    Ok(Some(state))
+    Ok(state)
 }
 
 fn is_hex_identifier(value: &str, lengths: &[usize]) -> bool {
@@ -906,17 +1089,22 @@ fn materialized_skill_contents(skill_path: &Path) -> Result<MaterializedSkillCon
         }
     };
     if !metadata.is_dir() {
-        return Ok(MaterializedSkillContents::UnsupportedEntry(display_path(
-            skill_path,
-        )));
+        return Ok(MaterializedSkillContents::UnsupportedEntry {
+            path: display_path(skill_path),
+            fingerprint: destination_entry_fingerprint(skill_path)?,
+        });
     }
 
     let mut files = Vec::new();
     let mut unsupported = None;
     collect_materialized_files(skill_path, skill_path, &mut files, &mut unsupported)?;
     if let Some(path) = unsupported {
-        return Ok(MaterializedSkillContents::UnsupportedEntry(path));
+        return Ok(MaterializedSkillContents::UnsupportedEntry {
+            path,
+            fingerprint: destination_entry_fingerprint(skill_path)?,
+        });
     }
+
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = Sha256::new();
     for (relative, path, mode) in files {
@@ -930,6 +1118,91 @@ fn materialized_skill_contents(skill_path: &Path) -> Result<MaterializedSkillCon
         "sha256:{:x}",
         hasher.finalize()
     )))
+}
+
+fn destination_entry_fingerprint(path: &Path) -> Result<String, SyncError> {
+    let mut hasher = Sha256::new();
+    update_destination_entry_fingerprint(&mut hasher, path, Path::new(""), path)?;
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn update_destination_entry_fingerprint(
+    hasher: &mut Sha256,
+    path: &Path,
+    relative: &Path,
+    root: &Path,
+) -> Result<(), SyncError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| SyncError::DestinationRead {
+        path: display_path(path),
+        source,
+    })?;
+    update_fingerprint_field(hasher, &fingerprint_path_bytes(relative));
+    if metadata.is_dir() {
+        update_fingerprint_field(hasher, b"directory");
+        let mut entries = fs::read_dir(path)
+            .map_err(|source| SyncError::DestinationRead {
+                path: display_path(path),
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| SyncError::DestinationRead {
+                path: display_path(path),
+                source,
+            })?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let entry_path = entry.path();
+            let relative = entry_path
+                .strip_prefix(root)
+                .expect("fingerprinted path is below its root");
+            update_destination_entry_fingerprint(hasher, &entry_path, relative, root)?;
+        }
+    } else if metadata.is_file() {
+        update_fingerprint_field(hasher, b"file");
+        update_fingerprint_field(hasher, materialized_file_mode(&metadata).as_bytes());
+        let contents = fs::read(path).map_err(|source| SyncError::DestinationRead {
+            path: display_path(path),
+            source,
+        })?;
+        update_fingerprint_field(hasher, &contents);
+    } else if metadata.file_type().is_symlink() {
+        update_fingerprint_field(hasher, b"symlink");
+        let target = fs::read_link(path).map_err(|source| SyncError::DestinationRead {
+            path: display_path(path),
+            source,
+        })?;
+        update_fingerprint_field(hasher, &fingerprint_path_bytes(&target));
+    } else {
+        update_fingerprint_field(hasher, b"other");
+    }
+    Ok(())
+}
+
+fn update_fingerprint_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+#[cfg(unix)]
+fn fingerprint_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn fingerprint_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn fingerprint_path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().as_bytes().to_vec()
 }
 
 fn collect_materialized_files(
@@ -1020,6 +1293,174 @@ fn ensure_destination_directory(destination: &Path) -> Result<(), SyncError> {
     Ok(())
 }
 
+fn validate_transaction_artifacts_for_rollback(
+    destination: &Path,
+    journal: &TransactionJournal,
+) -> Result<(Option<DestinationState>, DestinationState), SyncError> {
+    let transaction = destination.join(TRANSACTION_DIRECTORY);
+    let journal_path = transaction.join(TRANSACTION_JOURNAL_FILE);
+    validate_transaction_directories(&transaction, &journal_path)?;
+    let states = read_transaction_states(destination, journal)?;
+    validate_transaction_backups(destination, journal)?;
+    Ok(states)
+}
+
+fn validate_transaction_directories(
+    transaction: &Path,
+    journal_path: &Path,
+) -> Result<(), SyncError> {
+    for directory in ["staged", "backup", "installing", "discarded"] {
+        let path = transaction.join(directory);
+        require_directory(&path)
+            .map_err(|details| invalid_transaction_journal(journal_path, details))?;
+    }
+    Ok(())
+}
+
+fn read_transaction_states(
+    destination: &Path,
+    journal: &TransactionJournal,
+) -> Result<(Option<DestinationState>, DestinationState), SyncError> {
+    let transaction = destination.join(TRANSACTION_DIRECTORY);
+    let journal_path = transaction.join(TRANSACTION_JOURNAL_FILE);
+    let previous_state = journal
+        .previous_state_path
+        .as_ref()
+        .map(|path| {
+            read_transaction_state(
+                &transaction,
+                &journal_path,
+                path,
+                "previous destination state",
+            )
+        })
+        .transpose()?;
+    let next_state = read_transaction_state(
+        &transaction,
+        &journal_path,
+        &journal.next_state_path,
+        "next destination state",
+    )?;
+    validate_transaction_state_transition(
+        &journal_path,
+        journal,
+        previous_state.as_ref(),
+        &next_state,
+    )?;
+    if let (Some(previous_state), Some(backup_state_path)) =
+        (&previous_state, &journal.backup_state_path)
+    {
+        let backup_state_path = transaction.join(backup_state_path);
+        if entry_exists(&backup_state_path)? {
+            let backup_state = read_transaction_state(
+                &transaction,
+                &journal_path,
+                journal
+                    .backup_state_path
+                    .as_ref()
+                    .expect("checked backup state path"),
+                "backup destination state",
+            )?;
+            if &backup_state != previous_state {
+                return Err(invalid_transaction_journal(
+                    &journal_path,
+                    "backup destination state does not match the recorded previous state",
+                ));
+            }
+        }
+    }
+    Ok((previous_state, next_state))
+}
+
+fn read_transaction_state(
+    transaction: &Path,
+    journal_path: &Path,
+    relative_path: &str,
+    label: &str,
+) -> Result<DestinationState, SyncError> {
+    let state_path = transaction.join(relative_path);
+    require_regular_file(&state_path)
+        .map_err(|details| invalid_transaction_journal(journal_path, details))?;
+    let contents = fs::read(&state_path).map_err(|error| {
+        invalid_transaction_journal(journal_path, format!("could not read {label}: {error}"))
+    })?;
+    parse_destination_state(&contents, &state_path)
+        .map_err(|error| invalid_transaction_journal(journal_path, error.to_string()))
+}
+
+fn validate_transaction_state_transition(
+    journal_path: &Path,
+    journal: &TransactionJournal,
+    previous_state: Option<&DestinationState>,
+    next_state: &DestinationState,
+) -> Result<(), SyncError> {
+    let previous = previous_state
+        .map(|state| {
+            state
+                .managed_skills
+                .iter()
+                .map(|skill| (skill.name.as_str(), skill))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let next = next_state
+        .managed_skills
+        .iter()
+        .map(|skill| (skill.name.as_str(), skill))
+        .collect::<BTreeMap<_, _>>();
+    let operations = journal
+        .operations
+        .iter()
+        .map(|operation| (operation.name.as_str(), operation))
+        .collect::<BTreeMap<_, _>>();
+
+    for operation in &journal.operations {
+        let previous_skill = previous.get(operation.name.as_str()).copied();
+        let next_skill = next.get(operation.name.as_str()).copied();
+        let valid = match operation.kind {
+            TransactionOperationKind::Create => {
+                previous_skill.is_none()
+                    && next_skill.is_some_and(|skill| {
+                        operation.next_digest.as_deref() == Some(skill.digest.as_str())
+                    })
+            }
+            TransactionOperationKind::Update => {
+                previous_skill.is_some()
+                    && next_skill.is_some_and(|skill| {
+                        operation.next_digest.as_deref() == Some(skill.digest.as_str())
+                    })
+            }
+            TransactionOperationKind::Remove => previous_skill.is_some() && next_skill.is_none(),
+        };
+        if !valid {
+            return Err(invalid_transaction_journal(
+                journal_path,
+                format!(
+                    "operation for Materialized Skill '{}' does not match the recorded destination states",
+                    operation.name
+                ),
+            ));
+        }
+    }
+
+    let state_names = previous
+        .keys()
+        .chain(next.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if state_names
+        .into_iter()
+        .filter(|name| !operations.contains_key(name))
+        .any(|name| previous.get(name) != next.get(name))
+    {
+        return Err(invalid_transaction_journal(
+            journal_path,
+            "unchanged Materialized Skills differ between previous and next destination state",
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_unmanaged_entry_absent(path: &Path) -> Result<(), SyncError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Err(SyncError::UnmanagedCollision {
@@ -1037,7 +1478,8 @@ fn is_destination_name(name: &str) -> bool {
     let mut components = Path::new(name).components();
     matches!(components.next(), Some(Component::Normal(_)))
         && components.next().is_none()
-        && name != ".skill-manager-state.json"
+        && name != DESTINATION_STATE_FILE
+        && name != TRANSACTION_DIRECTORY
 }
 
 fn stage_materialized_skill(
@@ -1171,22 +1613,22 @@ fn stage_materializations(
     materializations: &[PlannedMaterialization],
     staged: &Path,
 ) -> Result<Vec<MaterializedSkill>, SyncError> {
-    materializations
-        .iter()
-        .map(|materialization| {
-            if cancellation_requested() {
-                return Err(SyncError::Cancelled);
-            }
-            let digest =
-                stage_materialized_skill(materialization, &staged.join(&materialization.name))?;
-            Ok(MaterializedSkill {
-                identity: materialization.identity.clone(),
-                name: materialization.name.clone(),
-                resolved_commit: materialization.resolved_commit.clone(),
-                digest,
-            })
-        })
-        .collect()
+    let mut staged_skills = Vec::with_capacity(materializations.len());
+    for materialization in materializations {
+        if cancellation_requested() {
+            return Err(SyncError::Cancelled);
+        }
+        let digest =
+            stage_materialized_skill(materialization, &staged.join(&materialization.name))?;
+        staged_skills.push(MaterializedSkill {
+            identity: materialization.identity.clone(),
+            name: materialization.name.clone(),
+            resolved_commit: materialization.resolved_commit.clone(),
+            digest,
+        });
+        request_sync_cancellation_for_test(SyncTestPoint::DuringStaging);
+    }
+    Ok(staged_skills)
 }
 
 fn invalid_materialization_git_output(materialization: &PlannedMaterialization) -> SyncError {
@@ -1265,157 +1707,78 @@ fn commit_synchronization(
     }
     ensure_destination_directory(destination)?;
 
-    let destination_parent = destination
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(destination_parent).map_err(|source| SyncError::DestinationWrite {
-        path: display_path(destination),
-        source,
-    })?;
-    let commit_stage =
-        TempDir::new_in(destination_parent).map_err(|source| SyncError::DestinationWrite {
-            path: display_path(destination),
-            source,
-        })?;
-    for skill in created.iter().chain(updated) {
-        copy_directory(
-            &staged.join(&skill.name),
-            &commit_stage.path().join(&skill.name),
-        )
-        .map_err(|source| SyncError::DestinationWrite {
-            path: display_path(destination),
-            source,
-        })?;
-    }
-    fs::write(commit_stage.path().join(".skill-manager-state.json"), state).map_err(|source| {
-        SyncError::DestinationWrite {
-            path: display_path(destination),
-            source,
+    let destination_existed = entry_exists(destination)?;
+    if destination_existed {
+        for skill in created {
+            ensure_unmanaged_entry_absent(&destination.join(&skill.name))?;
         }
-    })?;
-
-    ensure_destination_directory(destination)?;
-    if !entry_exists(destination)? {
-        return fs::rename(commit_stage.path(), destination).map_err(|source| {
-            SyncError::DestinationWrite {
-                path: display_path(destination),
-                source,
-            }
-        });
-    }
-
-    let backup =
-        TempDir::new_in(destination_parent).map_err(|source| SyncError::DestinationWrite {
-            path: display_path(destination),
-            source,
-        })?;
-    let mut moved_old = Vec::new();
-    let mut installed = Vec::new();
-    let mut old_state_moved = false;
-
-    for skill in created {
-        ensure_unmanaged_entry_absent(&destination.join(&skill.name))?;
-    }
-    let current_state = load_destination_state(destination)?;
-    if current_state.as_ref() != previous_state {
-        return Err(SyncError::DestinationChangedDuringSynchronization {
-            path: display_path(&destination.join(".skill-manager-state.json")),
-        });
-    }
-    for (name, observed) in observed_materialized_skills {
-        let path = destination.join(name);
-        if materialized_skill_contents(&path)? != *observed {
+        let current_state = load_destination_state(destination)?;
+        if current_state.as_ref() != previous_state {
             return Err(SyncError::DestinationChangedDuringSynchronization {
-                path: display_path(&path),
+                path: display_path(&destination.join(DESTINATION_STATE_FILE)),
             });
         }
-    }
-    let old_present = updated.iter().chain(removed).map(|skill| {
-        let observed = observed_materialized_skills
-            .get(&skill.name)
-            .expect("updated and removed Skills were observed before staging");
-        (
-            skill,
-            !matches!(observed, MaterializedSkillContents::Missing),
-        )
-    });
-
-    for (skill, exists) in old_present {
-        let target = destination.join(&skill.name);
-        if exists {
-            if let Err(source) = fs::rename(&target, backup.path().join(&skill.name)) {
-                return Err(commit_failure(
-                    destination,
-                    source,
-                    rollback_reconciliation(
-                        destination,
-                        commit_stage.path(),
-                        backup.path(),
-                        &installed,
-                        &moved_old,
-                        old_state_moved,
-                    ),
-                ));
+        for (name, observed) in observed_materialized_skills {
+            let path = destination.join(name);
+            if materialized_skill_contents(&path)? != *observed {
+                return Err(SyncError::DestinationChangedDuringSynchronization {
+                    path: display_path(&path),
+                });
             }
-            moved_old.push(skill.name.clone());
         }
-    }
-    for skill in created.iter().chain(updated) {
-        if let Err(source) = fs::rename(
-            commit_stage.path().join(&skill.name),
-            destination.join(&skill.name),
-        ) {
-            return Err(commit_failure(
-                destination,
-                source,
-                rollback_reconciliation(
-                    destination,
-                    commit_stage.path(),
-                    backup.path(),
-                    &installed,
-                    &moved_old,
-                    old_state_moved,
-                ),
-            ));
-        }
-        installed.push(skill.name.clone());
     }
 
-    let state_name = ".skill-manager-state.json";
-    let state_path = destination.join(state_name);
-    if previous_state.is_some() {
-        if let Err(source) = fs::rename(&state_path, backup.path().join(state_name)) {
-            return Err(commit_failure(
-                destination,
-                source,
-                rollback_reconciliation(
-                    destination,
-                    commit_stage.path(),
-                    backup.path(),
-                    &installed,
-                    &moved_old,
-                    old_state_moved,
-                ),
-            ));
-        }
-        old_state_moved = true;
+    let mut journal = transaction_journal(
+        destination_existed,
+        created,
+        updated,
+        removed,
+        previous_state,
+        observed_materialized_skills,
+    );
+    let prepare = prepare_transaction(destination, staged, state, previous_state, &journal);
+    if let Err(operation) = prepare {
+        return Err(if destination.join(TRANSACTION_DIRECTORY).exists() {
+            cleanup_after_transaction_failure(destination, &journal, operation)
+        } else {
+            operation
+        });
     }
-    if let Err(source) = fs::rename(commit_stage.path().join(state_name), &state_path) {
-        return Err(commit_failure(
+
+    journal.phase = TransactionPhase::Committing;
+    if let Err(source) = write_transaction_journal(destination, &journal) {
+        let operation = destination_write_error(destination, source);
+        return Err(cleanup_after_transaction_failure(
             destination,
-            source,
-            rollback_reconciliation(
-                destination,
-                commit_stage.path(),
-                backup.path(),
-                &installed,
-                &moved_old,
-                old_state_moved,
-            ),
+            &journal,
+            operation,
         ));
     }
-    Ok(())
+    interrupt_sync_for_test(SyncTestPoint::AfterJournal);
+
+    match complete_transaction_commit(destination, &journal) {
+        Ok(()) => cleanup_transaction(destination, &journal),
+        Err(operation) => {
+            journal.phase = TransactionPhase::RollingBack;
+            if let Err(source) = write_transaction_journal(destination, &journal) {
+                return Err(SyncError::Rollback {
+                    operation: Box::new(operation),
+                    rollback: source,
+                });
+            }
+            if let Err(rollback) = rollback_transaction(destination, &journal) {
+                return Err(SyncError::Rollback {
+                    operation: Box::new(operation),
+                    rollback: sync_error_as_io(rollback),
+                });
+            }
+            Err(cleanup_after_transaction_failure(
+                destination,
+                &journal,
+                operation,
+            ))
+        }
+    }
 }
 
 fn entry_exists(path: &Path) -> Result<bool, SyncError> {
@@ -1429,16 +1792,855 @@ fn entry_exists(path: &Path) -> Result<bool, SyncError> {
     }
 }
 
-fn commit_failure(
+fn transaction_journal(
+    destination_existed: bool,
+    created: &[MaterializedSkill],
+    updated: &[MaterializedSkill],
+    removed: &[MaterializedSkill],
+    previous_state: Option<&DestinationState>,
+    observed_materialized_skills: &BTreeMap<String, MaterializedSkillContents>,
+) -> TransactionJournal {
+    let mut operations = Vec::with_capacity(created.len() + updated.len() + removed.len());
+    operations.extend(created.iter().map(|skill| TransactionOperation {
+        name: skill.name.clone(),
+        kind: TransactionOperationKind::Create,
+        destination_path: skill.name.clone(),
+        staged_path: Some(format!("staged/{}", skill.name)),
+        backup_path: None,
+        previous: TransactionEntryState::Missing,
+        next_digest: Some(skill.digest.clone()),
+    }));
+    operations.extend(updated.iter().map(|skill| {
+        TransactionOperation {
+            name: skill.name.clone(),
+            kind: TransactionOperationKind::Update,
+            destination_path: skill.name.clone(),
+            staged_path: Some(format!("staged/{}", skill.name)),
+            backup_path: Some(format!("backup/{}", skill.name)),
+            previous: transaction_entry_state(
+                observed_materialized_skills
+                    .get(&skill.name)
+                    .expect("updated Skills were observed before staging"),
+            ),
+            next_digest: Some(skill.digest.clone()),
+        }
+    }));
+    operations.extend(removed.iter().map(|skill| {
+        TransactionOperation {
+            name: skill.name.clone(),
+            kind: TransactionOperationKind::Remove,
+            destination_path: skill.name.clone(),
+            staged_path: None,
+            backup_path: Some(format!("backup/{}", skill.name)),
+            previous: transaction_entry_state(
+                observed_materialized_skills
+                    .get(&skill.name)
+                    .expect("removed Skills were observed before staging"),
+            ),
+            next_digest: None,
+        }
+    }));
+    operations.sort_by(|left, right| left.name.cmp(&right.name));
+
+    TransactionJournal {
+        journal_version: 1,
+        owner: "skill-manager".to_owned(),
+        phase: TransactionPhase::Preparing,
+        destination_existed,
+        operations,
+        previous_state_path: previous_state
+            .is_some()
+            .then(|| "previous-state.json".to_owned()),
+        backup_state_path: previous_state
+            .is_some()
+            .then(|| format!("backup/{DESTINATION_STATE_FILE}")),
+        next_state_path: "next-state.json".to_owned(),
+    }
+}
+
+fn transaction_entry_state(contents: &MaterializedSkillContents) -> TransactionEntryState {
+    match contents {
+        MaterializedSkillContents::Missing => TransactionEntryState::Missing,
+        MaterializedSkillContents::Digest(digest) => TransactionEntryState::Digest(digest.clone()),
+        MaterializedSkillContents::UnsupportedEntry { fingerprint, .. } => {
+            TransactionEntryState::Unsupported(fingerprint.clone())
+        }
+    }
+}
+
+fn prepare_transaction(
     destination: &Path,
-    source: io::Error,
-    rollback: Result<(), io::Error>,
-) -> SyncError {
-    let operation = SyncError::DestinationWrite {
-        path: display_path(destination),
-        source,
+    staged: &Path,
+    state: &[u8],
+    previous_state: Option<&DestinationState>,
+    journal: &TransactionJournal,
+) -> Result<(), SyncError> {
+    let destination_parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(destination_parent)
+        .map_err(|source| destination_write_error(destination, source))?;
+    let prepared = TempDir::new_in(destination_parent)
+        .map_err(|source| destination_write_error(destination, source))?;
+    let transaction = prepared.path().join(TRANSACTION_DIRECTORY);
+    fs::create_dir(&transaction).map_err(|source| destination_write_error(destination, source))?;
+    write_transaction_journal_at(&transaction, journal)
+        .map_err(|source| destination_write_error(destination, source))?;
+    fs::create_dir(transaction.join("staged"))
+        .and_then(|()| fs::create_dir(transaction.join("backup")))
+        .and_then(|()| fs::create_dir(transaction.join("installing")))
+        .and_then(|()| fs::create_dir(transaction.join("discarded")))
+        .map_err(|source| destination_write_error(destination, source))?;
+    for operation in &journal.operations {
+        if operation.staged_path.is_some() {
+            copy_directory(
+                &staged.join(&operation.name),
+                &transaction.join("staged").join(&operation.name),
+            )
+            .map_err(|source| destination_write_error(destination, source))?;
+            sync_tree(&transaction.join("staged").join(&operation.name))
+                .map_err(|source| destination_write_error(destination, source))?;
+        }
+    }
+    sync_directory(&transaction.join("staged"))
+        .map_err(|source| destination_write_error(destination, source))?;
+    write_file_durable(&transaction.join(&journal.next_state_path), state)
+        .map_err(|source| destination_write_error(destination, source))?;
+    if let (Some(previous_state), Some(previous_state_path)) =
+        (previous_state, &journal.previous_state_path)
+    {
+        let contents = serde_json::to_vec_pretty(previous_state)
+            .expect("previous destination state is serializable");
+        write_file_durable(&transaction.join(previous_state_path), &contents)
+            .map_err(|source| destination_write_error(destination, source))?;
+    }
+    sync_directory(&transaction).map_err(|source| destination_write_error(destination, source))?;
+    sync_directory(prepared.path())
+        .map_err(|source| destination_write_error(destination, source))?;
+    if journal.destination_existed {
+        ensure_destination_directory(destination)?;
+        fs::rename(&transaction, destination.join(TRANSACTION_DIRECTORY))
+            .map_err(|source| destination_write_error(destination, source))?;
+        sync_directory(prepared.path())
+            .and_then(|()| sync_directory(destination))
+            .map_err(|source| destination_write_error(destination, source))?;
+    } else {
+        if entry_exists(destination)? {
+            return Err(SyncError::DestinationChangedDuringSynchronization {
+                path: display_path(destination),
+            });
+        }
+        let prepared = prepared.keep();
+        fs::rename(&prepared, destination)
+            .map_err(|source| destination_write_error(destination, source))?;
+        sync_directory(destination_parent)
+            .map_err(|source| destination_write_error(destination, source))?;
+    }
+    Ok(())
+}
+
+fn validate_preparing_destination(
+    destination: &Path,
+    journal: &TransactionJournal,
+    previous_state: Option<&DestinationState>,
+) -> Result<(), SyncError> {
+    let transaction = destination.join(TRANSACTION_DIRECTORY);
+    let journal_path = transaction.join(TRANSACTION_JOURNAL_FILE);
+    for directory in ["backup", "discarded"] {
+        let directory = transaction.join(directory);
+        let has_entries = fs::read_dir(&directory)
+            .map_err(|error| {
+                invalid_transaction_journal(
+                    &journal_path,
+                    format!("could not inspect '{}': {error}", display_path(&directory)),
+                )
+            })?
+            .next()
+            .is_some();
+        if has_entries {
+            return Err(invalid_transaction_journal(
+                &journal_path,
+                "preparing transaction contains commit or rollback data",
+            ));
+        }
+    }
+    for operation in &journal.operations {
+        let destination_path = destination.join(&operation.destination_path);
+        let pristine = match operation.kind {
+            TransactionOperationKind::Create => !entry_exists(&destination_path)?,
+            TransactionOperationKind::Update | TransactionOperationKind::Remove => {
+                entry_matches_previous(&destination_path, &operation.previous)?
+            }
+        };
+        if !pristine {
+            return Err(invalid_transaction_journal(
+                &journal_path,
+                format!(
+                    "preparing transaction destination '{}' does not match its previous content",
+                    operation.name
+                ),
+            ));
+        }
+    }
+    let state_path = destination.join(DESTINATION_STATE_FILE);
+    let current_state = read_optional_file(&state_path)
+        .map_err(|source| destination_write_error(destination, source))?;
+    let current_state = current_state
+        .as_deref()
+        .map(|contents| parse_destination_state(contents, &state_path))
+        .transpose()?;
+    if current_state.as_ref() != previous_state {
+        return Err(invalid_transaction_journal(
+            &journal_path,
+            "preparing transaction destination state does not match its previous state",
+        ));
+    }
+    Ok(())
+}
+
+fn complete_transaction_commit(
+    destination: &Path,
+    journal: &TransactionJournal,
+) -> Result<(), SyncError> {
+    let (previous_state, next_state) =
+        validate_transaction_artifacts_for_commit(destination, journal)?;
+    validate_transaction_destination(destination, journal, previous_state.as_ref(), &next_state)?;
+    let transaction = destination.join(TRANSACTION_DIRECTORY);
+    let backup = transaction.join("backup");
+
+    for operation in journal
+        .operations
+        .iter()
+        .filter(|operation| operation.kind.has_backup())
+    {
+        if cancellation_requested() {
+            return Err(SyncError::Cancelled);
+        }
+        let destination_path = destination.join(&operation.destination_path);
+        let backup_path = transaction.join(
+            operation
+                .backup_path
+                .as_ref()
+                .expect("updated and removed operations have backups"),
+        );
+        if entry_exists(&backup_path)?
+            || entry_matches_digest(&destination_path, operation.next_digest.as_deref())?
+        {
+            continue;
+        }
+        if !entry_matches_previous(&destination_path, &operation.previous)? {
+            return Err(SyncError::DestinationChangedDuringSynchronization {
+                path: display_path(&destination_path),
+            });
+        }
+        if entry_exists(&destination_path)? {
+            fs::rename(&destination_path, &backup_path)
+                .map_err(|source| destination_write_error(destination, source))?;
+            sync_directory(destination)
+                .and_then(|()| sync_directory(&backup))
+                .map_err(|source| destination_write_error(destination, source))?;
+        }
+    }
+    sync_directory(&backup).map_err(|source| destination_write_error(destination, source))?;
+    interrupt_sync_for_test(SyncTestPoint::AfterOldEntries);
+    request_sync_cancellation_for_test(SyncTestPoint::AfterOldEntries);
+
+    for operation in journal
+        .operations
+        .iter()
+        .filter(|operation| operation.kind.has_staged_content())
+    {
+        if cancellation_requested() {
+            return Err(SyncError::Cancelled);
+        }
+        let destination_path = destination.join(&operation.destination_path);
+        if entry_matches_digest(&destination_path, operation.next_digest.as_deref())? {
+            continue;
+        }
+        if entry_exists(&destination_path)? {
+            return Err(SyncError::DestinationChangedDuringSynchronization {
+                path: display_path(&destination_path),
+            });
+        }
+        let installing_path = transaction.join("installing").join(&operation.name);
+        remove_path_if_exists(&installing_path)
+            .map_err(|source| destination_write_error(destination, source))?;
+        copy_directory(
+            &transaction.join(
+                operation
+                    .staged_path
+                    .as_ref()
+                    .expect("created and updated operations have staged content"),
+            ),
+            &installing_path,
+        )
+        .map_err(|source| destination_write_error(destination, source))?;
+        sync_tree(&installing_path)
+            .map_err(|source| destination_write_error(destination, source))?;
+        fs::rename(&installing_path, &destination_path)
+            .map_err(|source| destination_write_error(destination, source))?;
+        sync_directory(
+            installing_path
+                .parent()
+                .expect("installing path has a parent"),
+        )
+        .and_then(|()| sync_directory(destination))
+        .map_err(|source| destination_write_error(destination, source))?;
+    }
+    sync_directory(destination).map_err(|source| destination_write_error(destination, source))?;
+    interrupt_sync_for_test(SyncTestPoint::AfterNewEntries);
+    request_sync_cancellation_for_test(SyncTestPoint::AfterNewEntries);
+    if cancellation_requested() {
+        return Err(SyncError::Cancelled);
+    }
+
+    let state_path = destination.join(DESTINATION_STATE_FILE);
+    let next_state_path = transaction.join(&journal.next_state_path);
+    let next_state = fs::read(&next_state_path)
+        .map_err(|source| destination_write_error(destination, source))?;
+    let current_state = read_optional_file(&state_path)
+        .map_err(|source| destination_write_error(destination, source))?;
+    if let Some(backup_state_path) = &journal.backup_state_path {
+        let backup_state_path = transaction.join(backup_state_path);
+        if !entry_exists(&backup_state_path)? && current_state.as_deref() != Some(&next_state) {
+            let Some(current_state) = current_state.as_deref() else {
+                return Err(SyncError::DestinationChangedDuringSynchronization {
+                    path: display_path(&state_path),
+                });
+            };
+            let current_state = parse_destination_state(current_state, &state_path)?;
+            if previous_state.as_ref() != Some(&current_state) {
+                return Err(SyncError::DestinationChangedDuringSynchronization {
+                    path: display_path(&state_path),
+                });
+            }
+            fs::rename(&state_path, &backup_state_path)
+                .map_err(|source| destination_write_error(destination, source))?;
+            sync_directory(destination)
+                .and_then(|()| sync_directory(&backup))
+                .map_err(|source| destination_write_error(destination, source))?;
+        }
+    } else if current_state.is_some() && current_state.as_deref() != Some(&next_state) {
+        return Err(SyncError::DestinationChangedDuringSynchronization {
+            path: display_path(&state_path),
+        });
+    }
+    sync_directory(&backup).map_err(|source| destination_write_error(destination, source))?;
+    interrupt_sync_for_test(SyncTestPoint::AfterOldState);
+    request_sync_cancellation_for_test(SyncTestPoint::AfterOldState);
+    if cancellation_requested() {
+        return Err(SyncError::Cancelled);
+    }
+
+    if read_optional_file(&state_path)
+        .map_err(|source| destination_write_error(destination, source))?
+        .as_deref()
+        != Some(&next_state)
+    {
+        write_file_atomic_durable(&state_path, &next_state)
+            .map_err(|source| destination_write_error(destination, source))?;
+    }
+    sync_directory(destination).map_err(|source| destination_write_error(destination, source))?;
+    interrupt_sync_for_test(SyncTestPoint::AfterNewState);
+    Ok(())
+}
+
+fn validate_transaction_destination(
+    destination: &Path,
+    journal: &TransactionJournal,
+    previous_state: Option<&DestinationState>,
+    next_state: &DestinationState,
+) -> Result<(), SyncError> {
+    let transaction = destination.join(TRANSACTION_DIRECTORY);
+    for operation in &journal.operations {
+        let destination_path = destination.join(&operation.destination_path);
+        let backup_exists = operation
+            .backup_path
+            .as_ref()
+            .map(|path| entry_exists(&transaction.join(path)))
+            .transpose()?
+            .unwrap_or(false);
+        let destination_exists = entry_exists(&destination_path)?;
+        let valid = if backup_exists {
+            match operation.kind {
+                TransactionOperationKind::Create => false,
+                TransactionOperationKind::Update => {
+                    !destination_exists
+                        || entry_matches_digest(
+                            &destination_path,
+                            operation.next_digest.as_deref(),
+                        )?
+                }
+                TransactionOperationKind::Remove => !destination_exists,
+            }
+        } else {
+            match operation.kind {
+                TransactionOperationKind::Create => {
+                    !destination_exists
+                        || entry_matches_digest(
+                            &destination_path,
+                            operation.next_digest.as_deref(),
+                        )?
+                }
+                TransactionOperationKind::Update => {
+                    entry_matches_previous(&destination_path, &operation.previous)?
+                        || entry_matches_digest(
+                            &destination_path,
+                            operation.next_digest.as_deref(),
+                        )?
+                }
+                TransactionOperationKind::Remove => {
+                    entry_matches_previous(&destination_path, &operation.previous)?
+                }
+            }
+        };
+        if !valid {
+            return Err(SyncError::DestinationChangedDuringSynchronization {
+                path: display_path(&destination_path),
+            });
+        }
+    }
+
+    let state_path = destination.join(DESTINATION_STATE_FILE);
+    let current_state = read_optional_file(&state_path)
+        .map_err(|source| destination_write_error(destination, source))?;
+    let current_state = current_state
+        .as_deref()
+        .map(|contents| parse_destination_state(contents, &state_path))
+        .transpose()?;
+    let backup_state_exists = journal
+        .backup_state_path
+        .as_ref()
+        .map(|path| entry_exists(&transaction.join(path)))
+        .transpose()?
+        .unwrap_or(false);
+    let valid_state = if backup_state_exists {
+        current_state
+            .as_ref()
+            .is_none_or(|current| current == next_state)
+    } else {
+        current_state.as_ref() == previous_state || current_state.as_ref() == Some(next_state)
     };
-    match rollback {
+    if !valid_state {
+        return Err(SyncError::DestinationChangedDuringSynchronization {
+            path: display_path(&state_path),
+        });
+    }
+    Ok(())
+}
+
+fn rollback_transaction(destination: &Path, journal: &TransactionJournal) -> Result<(), SyncError> {
+    let transaction = destination.join(TRANSACTION_DIRECTORY);
+    let backup = transaction.join("backup");
+    let (previous_state, next_state) =
+        validate_transaction_artifacts_for_rollback(destination, journal)?;
+    validate_rollback_destination(destination, journal, previous_state.as_ref(), &next_state)?;
+    for operation in journal.operations.iter().rev() {
+        let destination_path = destination.join(&operation.destination_path);
+        match operation.kind {
+            TransactionOperationKind::Create => {
+                discard_rollback_entry(destination, &transaction, operation)?;
+            }
+            TransactionOperationKind::Update | TransactionOperationKind::Remove => {
+                let backup_path = transaction.join(
+                    operation
+                        .backup_path
+                        .as_ref()
+                        .expect("updated and removed operations have backups"),
+                );
+                if entry_exists(&backup_path)? {
+                    if operation.kind == TransactionOperationKind::Update {
+                        discard_rollback_entry(destination, &transaction, operation)?;
+                    }
+                    fs::rename(&backup_path, &destination_path)
+                        .map_err(|source| destination_write_error(destination, source))?;
+                    sync_directory(&backup)
+                        .and_then(|()| sync_directory(destination))
+                        .map_err(|source| destination_write_error(destination, source))?;
+                } else if operation.kind == TransactionOperationKind::Update
+                    && operation.previous == TransactionEntryState::Missing
+                {
+                    discard_rollback_entry(destination, &transaction, operation)?;
+                }
+            }
+        }
+    }
+
+    let state_path = destination.join(DESTINATION_STATE_FILE);
+    let next_state = fs::read(transaction.join(&journal.next_state_path))
+        .map_err(|source| destination_write_error(destination, source))?;
+    if let Some(backup_state_path) = &journal.backup_state_path {
+        let backup_state_path = transaction.join(backup_state_path);
+        if entry_exists(&backup_state_path)? {
+            if let Some(current) = read_optional_file(&state_path)
+                .map_err(|source| destination_write_error(destination, source))?
+            {
+                if current != next_state {
+                    return Err(SyncError::DestinationChangedDuringSynchronization {
+                        path: display_path(&state_path),
+                    });
+                }
+                fs::remove_file(&state_path)
+                    .map_err(|source| destination_write_error(destination, source))?;
+                sync_directory(destination)
+                    .map_err(|source| destination_write_error(destination, source))?;
+            }
+            fs::rename(&backup_state_path, &state_path)
+                .map_err(|source| destination_write_error(destination, source))?;
+            sync_directory(&backup)
+                .and_then(|()| sync_directory(destination))
+                .map_err(|source| destination_write_error(destination, source))?;
+        } else {
+            let Some(current) = read_optional_file(&state_path)
+                .map_err(|source| destination_write_error(destination, source))?
+            else {
+                return Err(SyncError::DestinationChangedDuringSynchronization {
+                    path: display_path(&state_path),
+                });
+            };
+            let current = parse_destination_state(&current, &state_path)?;
+            if previous_state.as_ref() != Some(&current) {
+                return Err(SyncError::DestinationChangedDuringSynchronization {
+                    path: display_path(&state_path),
+                });
+            }
+        }
+    } else if let Some(current) = read_optional_file(&state_path)
+        .map_err(|source| destination_write_error(destination, source))?
+    {
+        if current != next_state {
+            return Err(SyncError::DestinationChangedDuringSynchronization {
+                path: display_path(&state_path),
+            });
+        }
+        fs::remove_file(&state_path)
+            .map_err(|source| destination_write_error(destination, source))?;
+        sync_directory(destination)
+            .map_err(|source| destination_write_error(destination, source))?;
+    }
+    sync_directory(&backup)
+        .and_then(|()| sync_directory(destination))
+        .map_err(|source| destination_write_error(destination, source))?;
+    Ok(())
+}
+
+fn discard_rollback_entry(
+    destination: &Path,
+    transaction: &Path,
+    operation: &TransactionOperation,
+) -> Result<(), SyncError> {
+    let destination_path = destination.join(&operation.destination_path);
+    let discarded_directory = transaction.join("discarded");
+    let discarded_path = discarded_directory.join(&operation.name);
+    if entry_exists(&discarded_path)? {
+        if !entry_matches_digest(&discarded_path, operation.next_digest.as_deref())?
+            || entry_exists(&destination_path)?
+        {
+            return Err(SyncError::DestinationChangedDuringSynchronization {
+                path: display_path(&destination_path),
+            });
+        }
+        return Ok(());
+    }
+    if !entry_exists(&destination_path)? {
+        return Ok(());
+    }
+    if !entry_matches_digest(&destination_path, operation.next_digest.as_deref())? {
+        return Err(SyncError::DestinationChangedDuringSynchronization {
+            path: display_path(&destination_path),
+        });
+    }
+    fs::rename(&destination_path, &discarded_path)
+        .map_err(|source| destination_write_error(destination, source))?;
+    sync_directory(destination)
+        .and_then(|()| sync_directory(&discarded_directory))
+        .map_err(|source| destination_write_error(destination, source))?;
+    interrupt_sync_for_test(SyncTestPoint::AfterRollbackDiscard);
+    Ok(())
+}
+
+fn validate_rollback_destination(
+    destination: &Path,
+    journal: &TransactionJournal,
+    previous_state: Option<&DestinationState>,
+    next_state: &DestinationState,
+) -> Result<(), SyncError> {
+    let transaction = destination.join(TRANSACTION_DIRECTORY);
+    let journal_path = transaction.join(TRANSACTION_JOURNAL_FILE);
+    for operation in &journal.operations {
+        let destination_path = destination.join(&operation.destination_path);
+        let backup_exists = operation
+            .backup_path
+            .as_ref()
+            .map(|path| entry_exists(&transaction.join(path)))
+            .transpose()?
+            .unwrap_or(false);
+        let discarded_path = transaction.join("discarded").join(&operation.name);
+        let discarded_exists = entry_exists(&discarded_path)?;
+        if discarded_exists
+            && (!operation.kind.has_staged_content()
+                || !entry_matches_digest(&discarded_path, operation.next_digest.as_deref())?)
+        {
+            return Err(invalid_transaction_journal(
+                &journal_path,
+                format!(
+                    "discarded Materialized Skill '{}' does not match its recorded content",
+                    operation.name
+                ),
+            ));
+        }
+        let destination_exists = entry_exists(&destination_path)?;
+        let valid = match operation.kind {
+            TransactionOperationKind::Create if discarded_exists => !destination_exists,
+            TransactionOperationKind::Create => {
+                !destination_exists
+                    || entry_matches_digest(&destination_path, operation.next_digest.as_deref())?
+            }
+            TransactionOperationKind::Update if discarded_exists && backup_exists => {
+                !destination_exists
+            }
+            TransactionOperationKind::Update if discarded_exists => {
+                entry_matches_previous(&destination_path, &operation.previous)?
+            }
+            TransactionOperationKind::Update if backup_exists => {
+                !destination_exists
+                    || entry_matches_digest(&destination_path, operation.next_digest.as_deref())?
+            }
+            TransactionOperationKind::Update
+                if operation.previous == TransactionEntryState::Missing =>
+            {
+                !destination_exists
+                    || entry_matches_digest(&destination_path, operation.next_digest.as_deref())?
+            }
+            TransactionOperationKind::Update => {
+                entry_matches_previous(&destination_path, &operation.previous)?
+            }
+            TransactionOperationKind::Remove if discarded_exists => false,
+            TransactionOperationKind::Remove if backup_exists => !destination_exists,
+            TransactionOperationKind::Remove => {
+                entry_matches_previous(&destination_path, &operation.previous)?
+            }
+        };
+        if !valid {
+            return Err(SyncError::DestinationChangedDuringSynchronization {
+                path: display_path(&destination_path),
+            });
+        }
+    }
+
+    let state_path = destination.join(DESTINATION_STATE_FILE);
+    let current_state = read_optional_file(&state_path)
+        .map_err(|source| destination_write_error(destination, source))?;
+    let current_state = current_state
+        .as_deref()
+        .map(|contents| parse_destination_state(contents, &state_path))
+        .transpose()?;
+    let backup_state_exists = journal
+        .backup_state_path
+        .as_ref()
+        .map(|path| entry_exists(&transaction.join(path)))
+        .transpose()?
+        .unwrap_or(false);
+    let valid_state = if backup_state_exists {
+        current_state
+            .as_ref()
+            .is_none_or(|current| current == next_state)
+    } else if previous_state.is_some() {
+        current_state.as_ref() == previous_state
+    } else {
+        current_state.is_none() || current_state.as_ref() == Some(next_state)
+    };
+    if !valid_state {
+        return Err(SyncError::DestinationChangedDuringSynchronization {
+            path: display_path(&state_path),
+        });
+    }
+    Ok(())
+}
+
+fn validate_transaction_journal(
+    destination: &Path,
+    journal: &TransactionJournal,
+) -> Result<(), SyncError> {
+    let journal_path = destination
+        .join(TRANSACTION_DIRECTORY)
+        .join(TRANSACTION_JOURNAL_FILE);
+    if journal.next_state_path != "next-state.json"
+        || journal.previous_state_path.as_deref()
+            != journal
+                .previous_state_path
+                .as_ref()
+                .map(|_| "previous-state.json")
+        || journal.backup_state_path.as_deref()
+            != journal
+                .previous_state_path
+                .as_ref()
+                .map(|_| format!("backup/{DESTINATION_STATE_FILE}"))
+                .as_deref()
+    {
+        return Err(invalid_transaction_journal(
+            &journal_path,
+            "transaction state paths are not valid",
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for operation in &journal.operations {
+        let expected_staged = format!("staged/{}", operation.name);
+        let expected_backup = format!("backup/{}", operation.name);
+        let valid_paths = operation.destination_path == operation.name
+            && operation.staged_path.as_deref()
+                == operation
+                    .kind
+                    .has_staged_content()
+                    .then_some(expected_staged.as_str())
+            && operation.backup_path.as_deref()
+                == operation
+                    .kind
+                    .has_backup()
+                    .then_some(expected_backup.as_str());
+        let valid_shape = match operation.kind {
+            TransactionOperationKind::Create => {
+                operation.previous == TransactionEntryState::Missing
+                    && operation.next_digest.is_some()
+            }
+            TransactionOperationKind::Update => operation.next_digest.is_some(),
+            TransactionOperationKind::Remove => operation.next_digest.is_none(),
+        };
+        if !is_destination_name(&operation.name)
+            || !names.insert(operation.name.as_str())
+            || !valid_paths
+            || !valid_shape
+            || operation
+                .next_digest
+                .as_deref()
+                .is_some_and(|digest| !valid_digest(digest))
+            || matches!(
+                &operation.previous,
+                TransactionEntryState::Digest(digest) if !valid_digest(digest)
+            )
+            || matches!(
+                &operation.previous,
+                TransactionEntryState::Unsupported(fingerprint) if !valid_digest(fingerprint)
+            )
+        {
+            return Err(invalid_transaction_journal(
+                &journal_path,
+                "transaction operation is not valid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_transaction_artifacts_for_commit(
+    destination: &Path,
+    journal: &TransactionJournal,
+) -> Result<(Option<DestinationState>, DestinationState), SyncError> {
+    let transaction = destination.join(TRANSACTION_DIRECTORY);
+    let journal_path = transaction.join(TRANSACTION_JOURNAL_FILE);
+    validate_transaction_directories(&transaction, &journal_path)?;
+    let states = read_transaction_states(destination, journal)?;
+    for operation in journal
+        .operations
+        .iter()
+        .filter(|operation| operation.kind.has_staged_content())
+    {
+        let staged_path = transaction.join(
+            operation
+                .staged_path
+                .as_ref()
+                .expect("created and updated operations have staged content"),
+        );
+        if !entry_matches_digest(&staged_path, operation.next_digest.as_deref())? {
+            return Err(invalid_transaction_journal(
+                &journal_path,
+                format!(
+                    "staged Materialized Skill '{}' does not match its recorded digest",
+                    operation.name
+                ),
+            ));
+        }
+    }
+    validate_transaction_backups(destination, journal)?;
+    Ok(states)
+}
+
+fn validate_transaction_backups(
+    destination: &Path,
+    journal: &TransactionJournal,
+) -> Result<(), SyncError> {
+    let transaction = destination.join(TRANSACTION_DIRECTORY);
+    let journal_path = transaction.join(TRANSACTION_JOURNAL_FILE);
+    for operation in journal
+        .operations
+        .iter()
+        .filter(|operation| operation.kind.has_backup())
+    {
+        let backup_path = transaction.join(
+            operation
+                .backup_path
+                .as_ref()
+                .expect("updated and removed operations have backups"),
+        );
+        if entry_exists(&backup_path)?
+            && !entry_matches_previous(&backup_path, &operation.previous)?
+        {
+            return Err(invalid_transaction_journal(
+                &journal_path,
+                format!(
+                    "backup for Materialized Skill '{}' does not match its recorded content",
+                    operation.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_transaction_journal(destination: &Path, journal: &TransactionJournal) -> io::Result<()> {
+    write_transaction_journal_at(&destination.join(TRANSACTION_DIRECTORY), journal)
+}
+
+fn write_transaction_journal_at(
+    transaction: &Path,
+    journal: &TransactionJournal,
+) -> io::Result<()> {
+    let contents = serde_json::to_vec_pretty(journal).expect("transaction journal is serializable");
+    write_file_atomic_durable(&transaction.join(TRANSACTION_JOURNAL_FILE), &contents)
+}
+
+fn cleanup_transaction(destination: &Path, journal: &TransactionJournal) -> Result<(), SyncError> {
+    cleanup_transaction_io(destination, journal)
+        .map_err(|source| destination_write_error(destination, source))
+}
+
+fn cleanup_transaction_io(destination: &Path, journal: &TransactionJournal) -> io::Result<()> {
+    let transaction = destination.join(TRANSACTION_DIRECTORY);
+    if fs::symlink_metadata(&transaction).is_ok() {
+        let destination_parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let cleanup = TempDir::new_in(destination_parent)?.keep();
+        fs::remove_dir(&cleanup)?;
+        fs::rename(&transaction, &cleanup)?;
+        sync_directory(destination)?;
+        remove_path_if_exists(&cleanup)?;
+        sync_directory(destination_parent)?;
+    }
+    if !journal.destination_existed && fs::read_dir(destination)?.next().is_none() {
+        fs::remove_dir(destination)?;
+    }
+    Ok(())
+}
+
+fn cleanup_after_transaction_failure(
+    destination: &Path,
+    journal: &TransactionJournal,
+    operation: SyncError,
+) -> SyncError {
+    match cleanup_transaction_io(destination, journal) {
         Ok(()) => operation,
         Err(rollback) => SyncError::Rollback {
             operation: Box::new(operation),
@@ -1447,42 +2649,133 @@ fn commit_failure(
     }
 }
 
-fn rollback_reconciliation(
-    destination: &Path,
-    commit_stage: &Path,
-    backup: &Path,
-    installed: &[String],
-    moved_old: &[String],
-    old_state_moved: bool,
-) -> Result<(), io::Error> {
-    let state_name = ".skill-manager-state.json";
-    let mut first_error = None;
-    for name in installed.iter().rev() {
-        record_rollback(
-            fs::rename(destination.join(name), commit_stage.join(name)),
-            &mut first_error,
-        );
+fn entry_matches_previous(
+    path: &Path,
+    previous: &TransactionEntryState,
+) -> Result<bool, SyncError> {
+    match previous {
+        TransactionEntryState::Missing => Ok(!entry_exists(path)?),
+        TransactionEntryState::Digest(digest) => entry_matches_digest(path, Some(digest.as_str())),
+        TransactionEntryState::Unsupported(fingerprint) => {
+            if !entry_exists(path)? {
+                return Ok(false);
+            }
+            Ok(destination_entry_fingerprint(path)? == *fingerprint)
+        }
     }
-    for name in moved_old.iter().rev() {
-        record_rollback(
-            fs::rename(backup.join(name), destination.join(name)),
-            &mut first_error,
-        );
-    }
-    if old_state_moved {
-        record_rollback(
-            fs::rename(backup.join(state_name), destination.join(state_name)),
-            &mut first_error,
-        );
-    }
-    first_error.map_or(Ok(()), Err)
 }
 
-fn record_rollback(result: io::Result<()>, first_error: &mut Option<io::Error>) {
-    if first_error.is_none() {
-        *first_error = result.err();
+fn entry_matches_digest(path: &Path, digest: Option<&str>) -> Result<bool, SyncError> {
+    let Some(digest) = digest else {
+        return Ok(false);
+    };
+    Ok(materialized_skill_contents(path)?.has_digest(digest))
+}
+
+fn valid_digest(digest: &str) -> bool {
+    digest
+        .strip_prefix("sha256:")
+        .is_some_and(|value| is_hex_identifier(value, &[64]))
+}
+
+fn read_optional_file(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
 }
+
+fn remove_path_if_exists(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+fn write_file_durable(path: &Path, contents: &[u8]) -> io::Result<()> {
+    fs::write(path, contents)?;
+    fs::File::open(path)?.sync_all()
+}
+
+fn write_file_atomic_durable(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    sync_directory(parent)
+}
+
+fn sync_tree(path: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            sync_tree(&path)?;
+        } else {
+            fs::File::open(&path)?.sync_all()?;
+        }
+    }
+    sync_directory(path)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn destination_write_error(destination: &Path, source: io::Error) -> SyncError {
+    SyncError::DestinationWrite {
+        path: display_path(destination),
+        source,
+    }
+}
+
+fn invalid_transaction_journal(path: &Path, details: impl Into<String>) -> SyncError {
+    SyncError::InvalidTransactionJournal {
+        path: display_path(path),
+        details: details.into(),
+    }
+}
+
+fn sync_error_as_io(error: SyncError) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
+#[cfg(debug_assertions)]
+fn interrupt_sync_for_test(point: SyncTestPoint) {
+    if std::env::var("SKILL_MANAGER_TEST_SYNC_INTERRUPT_AT").as_deref() == Ok(point.as_str()) {
+        std::process::exit(86);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn interrupt_sync_for_test(_point: SyncTestPoint) {}
+
+#[cfg(debug_assertions)]
+fn request_sync_cancellation_for_test(point: SyncTestPoint) {
+    if std::env::var("SKILL_MANAGER_TEST_SYNC_CANCEL_AT").as_deref() == Ok(point.as_str()) {
+        CANCELLATION_REQUESTED.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn request_sync_cancellation_for_test(_point: SyncTestPoint) {}
 
 fn copy_directory(source: &Path, destination: &Path) -> io::Result<()> {
     fs::create_dir(destination)?;
